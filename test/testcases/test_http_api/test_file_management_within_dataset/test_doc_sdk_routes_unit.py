@@ -14,16 +14,21 @@
 #  limitations under the License.
 #
 import asyncio
+import functools
 import inspect
 import importlib.util
 import sys
 from pathlib import Path
+from enum import StrEnum
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
 
-from api.db import FileType
+
+class FileType(StrEnum):
+    PDF = "pdf"
+    OTHER = "other"
 
 
 @pytest.fixture(scope="session")
@@ -42,6 +47,19 @@ class _DummyManager:
             return func
 
         return decorator
+
+
+def _identity_route_decorator(func=None, **_kwargs):
+    def decorator(inner):
+        @functools.wraps(inner)
+        async def wrapper(*args, **kwargs):
+            return await inner(*args, **kwargs)
+
+        return wrapper
+
+    if func is None:
+        return decorator
+    return decorator(func)
 
 
 class _AwaitableValue:
@@ -137,7 +155,11 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
     monkeypatch.setitem(sys.modules, "common", common_pkg)
 
     apps_mod = ModuleType("api.apps")
-    apps_mod.login_required = lambda func: func
+    apps_mod.AUTH_JWT = "auth_jwt"
+    apps_mod.AUTH_API = "auth_api"
+    apps_mod.AUTH_BETA = "auth_beta"
+    apps_mod.current_user = SimpleNamespace(id="user-1")
+    apps_mod.login_required = _identity_route_decorator
     monkeypatch.setitem(sys.modules, "api.apps", apps_mod)
 
     common_settings_mod = ModuleType("common.settings")
@@ -149,6 +171,8 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
     common_misc_utils_mod = ModuleType("common.misc_utils")
     async def _thread_pool_exec(func, *args, **kwargs):
         return func(*args, **kwargs)
+
+    common_misc_utils_mod.get_uuid = lambda: "uuid-1"
     common_misc_utils_mod.thread_pool_exec = _thread_pool_exec
     monkeypatch.setitem(sys.modules, "common.misc_utils", common_misc_utils_mod)
 
@@ -193,6 +217,7 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
 
     services_pkg = ModuleType("api.db.services")
     services_pkg.__path__ = [str(repo_root / "api" / "db" / "services")]
+    services_pkg.duplicate_name = lambda query, **kwargs: kwargs.get("name", "duplicate")
     monkeypatch.setitem(sys.modules, "api.db.services", services_pkg)
 
     doc_metadata_service_mod = ModuleType("api.db.services.doc_metadata_service")
@@ -220,10 +245,14 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
     )
     monkeypatch.setitem(sys.modules, "api.db.services.file2document_service", file2document_service_mod)
 
+    file_service_mod = ModuleType("api.db.services.file_service")
+    file_service_mod.FileService = SimpleNamespace(upload_info=lambda *_args, **_kwargs: {})
+    monkeypatch.setitem(sys.modules, "api.db.services.file_service", file_service_mod)
+
     knowledgebase_service_mod = ModuleType("api.db.services.knowledgebase_service")
     knowledgebase_service_mod.KnowledgebaseService = SimpleNamespace(
         accessible=lambda **_kwargs: False,
-        get_by_id=lambda *_args, **_kwargs: (False, None),
+        get_by_id=lambda *_args, **_kwargs: (True, SimpleNamespace(tenant_id="tenant-1", pagerank=0.6, tenant_embd_id=2, tenant_llm_id=1)),
         get_by_ids=lambda *_args, **_kwargs: [],
         list_documents_by_ids=lambda *_args, **_kwargs: [],
         query=lambda **_kwargs: [],
@@ -231,7 +260,10 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
     monkeypatch.setitem(sys.modules, "api.db.services.knowledgebase_service", knowledgebase_service_mod)
 
     task_service_mod = ModuleType("api.db.services.task_service")
-    task_service_mod.TaskService = SimpleNamespace(filter_delete=lambda *_args, **_kwargs: None)
+    task_service_mod.TaskService = SimpleNamespace(
+        filter_delete=lambda *_args, **_kwargs: None,
+        query=lambda **_kwargs: [],
+    )
     task_service_mod.cancel_all_task_of = lambda *_args, **_kwargs: None
     task_service_mod.queue_tasks = lambda *_args, **_kwargs: None
     monkeypatch.setitem(sys.modules, "api.db.services.task_service", task_service_mod)
@@ -240,7 +272,10 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
     api_utils_mod.add_tenant_id_to_kwargs = lambda func: func
     api_utils_mod.check_duplicate_ids = lambda ids, _kind="item": (ids, [])
     api_utils_mod.construct_json_result = lambda code=0, message="success", data=None: {"code": code, "message": message, "data": data}
+    api_utils_mod.get_data_error_result = lambda message="": {"code": 102, "message": message}
+    api_utils_mod.get_error_argument_result = lambda message="": {"code": 101, "message": message}
     api_utils_mod.get_error_data_result = lambda message="Sorry! Data missing!", code=102: {"code": code, "message": message}
+    api_utils_mod.get_json_result = lambda code=0, message="success", data=None: {"code": code, "message": message, "data": data}
     api_utils_mod.get_request_json = lambda: _AwaitableValue({})
     api_utils_mod.get_result = lambda code=0, message="", data=None, total=None: {
         key: value
@@ -276,10 +311,42 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
     reference_metadata_utils_mod.enrich_chunks_with_document_metadata = _enrich_chunks_with_document_metadata
     monkeypatch.setitem(sys.modules, "api.utils.reference_metadata_utils", reference_metadata_utils_mod)
 
+    api_common_pkg = ModuleType("api.common")
+    api_common_pkg.__path__ = []
+    monkeypatch.setitem(sys.modules, "api.common", api_common_pkg)
+
+    check_team_permission_mod = ModuleType("api.common.check_team_permission")
+    check_team_permission_mod.check_kb_team_permission = lambda *_args, **_kwargs: True
+    monkeypatch.setitem(sys.modules, "api.common.check_team_permission", check_team_permission_mod)
+
+    validation_utils_mod = ModuleType("api.utils.validation_utils")
+    validation_utils_mod.UpdateDocumentReq = object
+    validation_utils_mod.DeleteDocumentReq = object
+    validation_utils_mod.format_validation_error_message = lambda error: str(error)
+    validation_utils_mod.validate_and_parse_json_request = lambda *_args, **_kwargs: _AwaitableValue({})
+    monkeypatch.setitem(sys.modules, "api.utils.validation_utils", validation_utils_mod)
+
+    file_utils_mod = ModuleType("api.utils.file_utils")
+    file_utils_mod.filename_type = lambda filename: filename.rsplit(".", 1)[-1] if "." in filename else ""
+    file_utils_mod.thumbnail = lambda *_args, **_kwargs: b""
+    monkeypatch.setitem(sys.modules, "api.utils.file_utils", file_utils_mod)
+
+    web_utils_mod = ModuleType("api.utils.web_utils")
+    web_utils_mod.CONTENT_TYPE_MAP = {"pdf": "application/pdf", "txt": "text/plain"}
+    web_utils_mod.html2pdf = lambda *_args, **_kwargs: b""
+    web_utils_mod.is_valid_url = lambda *_args, **_kwargs: True
+    web_utils_mod.apply_safe_file_response_headers = lambda response, *_args, **_kwargs: response
+    monkeypatch.setitem(sys.modules, "api.utils.web_utils", web_utils_mod)
+
     common_metadata_utils_mod = ModuleType("common.metadata_utils")
     common_metadata_utils_mod.convert_conditions = lambda conditions: conditions
     common_metadata_utils_mod.meta_filter = lambda *_args, **_kwargs: []
+    common_metadata_utils_mod.turn2jsonschema = lambda *_args, **_kwargs: {}
     monkeypatch.setitem(sys.modules, "common.metadata_utils", common_metadata_utils_mod)
+
+    ssrf_guard_mod = ModuleType("common.ssrf_guard")
+    ssrf_guard_mod.assert_url_is_safe = lambda *_args, **_kwargs: True
+    monkeypatch.setitem(sys.modules, "common.ssrf_guard", ssrf_guard_mod)
 
     rag_app_tag_mod = ModuleType("rag.app.tag")
     rag_app_tag_mod.label_question = lambda *_args, **_kwargs: {}
@@ -291,6 +358,11 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
     monkeypatch.setitem(sys.modules, "rag.prompts.generator", rag_prompts_generator_mod)
 
     rag_nlp_mod = ModuleType("rag.nlp")
+    rag_nlp_mod.rag_tokenizer = SimpleNamespace(
+        tokenize=lambda text: text or "",
+        fine_grained_tokenize=lambda text: text or "",
+        is_chinese=lambda _text: False,
+    )
     rag_nlp_mod.search = SimpleNamespace(index_name=lambda tenant_id: f"idx_{tenant_id}")
     monkeypatch.setitem(sys.modules, "rag.nlp", rag_nlp_mod)
     monkeypatch.setitem(sys.modules, "rag.nlp.search", rag_nlp_mod.search)
@@ -481,6 +553,7 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
     tenant_model_service_mod.get_model_config_by_id = _get_model_config_by_id
     tenant_model_service_mod.get_model_config_from_provider_instance = _get_model_config_from_provider_instance
     tenant_model_service_mod.get_tenant_default_model_by_type = _get_tenant_default_model_by_type
+    tenant_model_service_mod.split_model_name = lambda model_name: (model_name, None)
     monkeypatch.setitem(sys.modules, "api.db.joint_services.tenant_model_service", tenant_model_service_mod)
 
     if module_basename == "document_api":
@@ -506,6 +579,7 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
     module = importlib.util.module_from_spec(spec)
     module.manager = _DummyManager()
     spec.loader.exec_module(module)
+    module.rag_tokenizer = rag_nlp_mod.rag_tokenizer
     return module
 
 
@@ -559,71 +633,36 @@ class TestDocRoutesUnit:
         assert "length of 5" in str(exc_info.value)
 
     def test_download_and_download_doc_errors(self, monkeypatch):
-        module = _load_doc_module(monkeypatch)
+        module = _load_doc_module(monkeypatch, module_basename="document_api")
         _patch_send_file(monkeypatch, module)
         _patch_storage(monkeypatch, module, file_stream=b"")
-        res = _run(module.download.__wrapped__("tenant-1", "ds-1", ""))
+        res = _run(module.download.__wrapped__("ds-1", ""))
         assert res["message"] == "Specify document_id please."
-        monkeypatch.setattr(module.KnowledgebaseService, "query", lambda **_kwargs: [])
-        res = _run(module.download.__wrapped__("tenant-1", "ds-1", "doc-1"))
-        assert "do not own the dataset" in res["message"]
 
-        monkeypatch.setattr(module.KnowledgebaseService, "query", lambda **_kwargs: [1])
         monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [])
-        res = _run(module.download.__wrapped__("tenant-1", "ds-1", "doc-1"))
+        res = _run(module.download.__wrapped__("ds-1", "doc-1"))
         assert "not own the document" in res["message"]
 
         monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [_DummyDoc()])
         monkeypatch.setattr(module.File2DocumentService, "get_storage_address", lambda **_kwargs: ("b", "n"))
-        res = _run(module.download.__wrapped__("tenant-1", "ds-1", "doc-1"))
+        res = _run(module.download.__wrapped__("ds-1", "doc-1"))
         assert res["message"] == "This file is empty."
 
-        monkeypatch.setattr(module, "request", SimpleNamespace(headers={"Authorization": "Bearer"}))
-        res = _run(module.download_doc("doc-1"))
-        assert "Authorization is not valid" in res["message"]
-
-        monkeypatch.setattr(module, "request", SimpleNamespace(headers={"Authorization": "Bearer token"}))
-        monkeypatch.setattr(module.APIToken, "query", lambda **_kwargs: [])
-        res = _run(module.download_doc("doc-1"))
-        assert "API key is invalid" in res["message"]
-
-        monkeypatch.setattr(module.APIToken, "query", lambda **_kwargs: [SimpleNamespace(tenant_id="tenant-1"), SimpleNamespace(tenant_id="tenant-2")])
-        res = _run(module.download_doc("doc-1"))
-        assert "API key configuration is ambiguous" in res["message"]
-
-        monkeypatch.setattr(module.APIToken, "query", lambda **_kwargs: [SimpleNamespace(tenant_id="tenant-1")])
-        res = _run(module.download_doc(""))
+        res = _run(module.download_document.__wrapped__(""))
         assert res["message"] == "Specify document_id please."
 
         monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [])
-        res = _run(module.download_doc("doc-1"))
+        res = _run(module.download_document.__wrapped__("doc-1"))
         assert "not own the document" in res["message"]
 
         monkeypatch.setattr(module.DocumentService, "query", lambda **_kwargs: [_DummyDoc()])
-        kb_query_calls = []
-
-        def _deny_kb_query(**kwargs):
-            kb_query_calls.append(kwargs)
-            return []
-
-        monkeypatch.setattr(module.KnowledgebaseService, "query", _deny_kb_query)
-        monkeypatch.setattr(
-            module.File2DocumentService,
-            "get_storage_address",
-            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("storage lookup must not run before tenant authorization")),
-        )
-        res = _run(module.download_doc("doc-1"))
-        assert res["message"] == "You do not have access to this document."
-        assert kb_query_calls == [{"id": "kb-1", "tenant_id": "tenant-1"}]
-
-        monkeypatch.setattr(module.KnowledgebaseService, "query", lambda **_kwargs: [1])
         monkeypatch.setattr(module.File2DocumentService, "get_storage_address", lambda **_kwargs: ("b", "n"))
         _patch_storage(monkeypatch, module, file_stream=b"")
-        res = _run(module.download_doc("doc-1"))
+        res = _run(module.download_document.__wrapped__("doc-1"))
         assert res["message"] == "This file is empty."
 
         _patch_storage(monkeypatch, module, file_stream=b"abc")
-        res = _run(module.download_doc("doc-1"))
+        res = _run(module.download_document.__wrapped__("doc-1"))
         assert res["filename"] == "doc.txt"
 
     def test_download_mimetype_from_filename(self, monkeypatch):
@@ -1022,7 +1061,7 @@ class TestDocRoutesUnit:
 
         monkeypatch.setattr(module, "get_request_json", lambda: _AwaitableValue({"content": "Q?\nA!"}))
         _patch_docstore(monkeypatch, module, get=lambda *_args, **_kwargs: {"doc_id": "doc-1", "content_with_weight": "Q?\nA!"}, update=lambda *_args, **_kwargs: None)
-        monkeypatch.setattr(module, "beAdoc", lambda d, *_args, **_kwargs: d)
+        monkeypatch.setattr(sys.modules["rag.app.qa"], "beAdoc", lambda d, *_args, **_kwargs: d)
         res = _run(_route_core(module.update_chunk)("tenant-1", "ds-1", "doc-1", "chunk-1"))
         assert res["code"] == 0
 

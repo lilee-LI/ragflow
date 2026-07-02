@@ -15,6 +15,7 @@
 #
 
 import asyncio
+import functools
 import inspect
 import importlib.util
 import sys
@@ -30,6 +31,19 @@ class _DummyManager:
             return func
 
         return decorator
+
+
+def _identity_route_decorator(func=None, **_kwargs):
+    def decorator(inner):
+        @functools.wraps(inner)
+        async def wrapper(*args, **kwargs):
+            return await inner(*args, **kwargs)
+
+        return wrapper
+
+    if func is None:
+        return decorator
+    return decorator(func)
 
 
 class _AwaitableValue:
@@ -78,6 +92,43 @@ class _DummyRetCode:
 class _DummyParserType:
     QA = "qa"
     NAIVE = "naive"
+
+
+class _DummyTaskStatus:
+    UNSTART = SimpleNamespace(value="0")
+    RUNNING = SimpleNamespace(value="1")
+    CANCEL = SimpleNamespace(value="2")
+    DONE = SimpleNamespace(value="3")
+    FAIL = SimpleNamespace(value="4")
+    SCHEDULE = SimpleNamespace(value="5")
+
+
+class _FakeExpr:
+    def __or__(self, other):
+        return self
+
+    def __and__(self, other):
+        return self
+
+
+class _FakeField:
+    def __eq__(self, other):
+        return _FakeExpr()
+
+    def __ne__(self, other):
+        return _FakeExpr()
+
+    def is_null(self, value=True):
+        return _FakeExpr()
+
+
+class _StubDocumentModel:
+    id = _FakeField()
+    run = _FakeField()
+
+
+class _StubTaskModel:
+    doc_id = _FakeField()
 
 
 class _DummyRetriever:
@@ -222,6 +273,7 @@ def _load_chunk_module(monkeypatch):
     constants_mod.RetCode = _DummyRetCode
     constants_mod.LLMType = _DummyLLMType
     constants_mod.ParserType = _DummyParserType
+    constants_mod.TaskStatus = _DummyTaskStatus
     constants_mod.PAGERANK_FLD = "pagerank_flt"
     monkeypatch.setitem(sys.modules, "common.constants", constants_mod)
 
@@ -232,12 +284,14 @@ def _load_chunk_module(monkeypatch):
 
     metadata_utils_mod = ModuleType("common.metadata_utils")
     metadata_utils_mod.apply_meta_data_filter = lambda *_args, **_kwargs: {}
+    metadata_utils_mod.convert_conditions = lambda conditions: conditions
+    metadata_utils_mod.meta_filter = lambda *_args, **_kwargs: []
     monkeypatch.setitem(sys.modules, "common.metadata_utils", metadata_utils_mod)
 
     misc_utils_mod = ModuleType("common.misc_utils")
 
-    async def _thread_pool_exec(func):
-        return func()
+    async def _thread_pool_exec(func, *args, **kwargs):
+        return func(*args, **kwargs)
 
     misc_utils_mod.thread_pool_exec = _thread_pool_exec
     monkeypatch.setitem(sys.modules, "common.misc_utils", misc_utils_mod)
@@ -280,11 +334,12 @@ def _load_chunk_module(monkeypatch):
     apps_mod = ModuleType("api.apps")
     apps_mod.__path__ = [str(repo_root / "api" / "apps")]
     apps_mod.current_user = SimpleNamespace(id="user-1")
-    apps_mod.login_required = lambda func: func
+    apps_mod.login_required = _identity_route_decorator
     monkeypatch.setitem(sys.modules, "api.apps", apps_mod)
 
     api_utils_mod = ModuleType("api.utils.api_utils")
     api_utils_mod.get_json_result = lambda data=None, message="", code=0: {"code": code, "message": message, "data": data}
+    api_utils_mod.construct_json_result = lambda data=None, message="success", code=0: {"code": code, "message": message, "data": data}
     api_utils_mod.get_data_error_result = lambda message="": {"code": _DummyRetCode.DATA_ERROR, "message": message, "data": False}
     api_utils_mod.get_result = lambda data=None, message="", code=0: {"code": code, "message": message, "data": data}
     api_utils_mod.get_error_data_result = lambda message="": {"code": _DummyRetCode.DATA_ERROR, "message": message, "data": False}
@@ -308,10 +363,16 @@ def _load_chunk_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "api.db.joint_services", joint_services_pkg)
 
     tenant_model_service_mod = ModuleType("api.db.joint_services.tenant_model_service")
+    tenant_model_service_mod.split_model_name = lambda model_name: (model_name, None)
     tenant_model_service_mod.get_model_config_by_id = lambda *_args, **_kwargs: {"llm_name": "embed", "model_type": "embedding"}
     tenant_model_service_mod.get_model_config_from_provider_instance = lambda *_args, **_kwargs: {"llm_name": "embed", "model_type": "embedding"}
     tenant_model_service_mod.get_tenant_default_model_by_type = lambda *_args, **_kwargs: {"llm_name": "chat", "model_type": "chat"}
     monkeypatch.setitem(sys.modules, "api.db.joint_services.tenant_model_service", tenant_model_service_mod)
+
+    db_models_mod = ModuleType("api.db.db_models")
+    db_models_mod.Document = _StubDocumentModel
+    db_models_mod.Task = _StubTaskModel
+    monkeypatch.setitem(sys.modules, "api.db.db_models", db_models_mod)
 
     document_service_mod = ModuleType("api.db.services.document_service")
 
@@ -359,10 +420,24 @@ def _load_chunk_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "api.db.services.document_service", document_service_mod)
     services_pkg.document_service = document_service_mod
 
+    file2document_service_mod = ModuleType("api.db.services.file2document_service")
+    file2document_service_mod.File2DocumentService = SimpleNamespace(
+        get_storage_address=lambda **_kwargs: ("bucket", "document.bin"),
+    )
+    monkeypatch.setitem(sys.modules, "api.db.services.file2document_service", file2document_service_mod)
+    services_pkg.file2document_service = file2document_service_mod
+
     doc_metadata_service_mod = ModuleType("api.db.services.doc_metadata_service")
     doc_metadata_service_mod.DocMetadataService = type("DocMetadataService", (), {})
     monkeypatch.setitem(sys.modules, "api.db.services.doc_metadata_service", doc_metadata_service_mod)
     services_pkg.doc_metadata_service = doc_metadata_service_mod
+
+    task_service_mod = ModuleType("api.db.services.task_service")
+    task_service_mod.TaskService = SimpleNamespace(filter_delete=lambda *_args, **_kwargs: None)
+    task_service_mod.cancel_all_task_of = lambda *_args, **_kwargs: None
+    task_service_mod.queue_tasks = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "api.db.services.task_service", task_service_mod)
+    services_pkg.task_service = task_service_mod
 
     kb_service_mod = ModuleType("api.db.services.knowledgebase_service")
 
@@ -512,6 +587,7 @@ def _load_chunk_api_module(monkeypatch):
     module.manager = _DummyManager()
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
+    module.rag_tokenizer = sys.modules["rag.nlp"].rag_tokenizer
     return module
 
 

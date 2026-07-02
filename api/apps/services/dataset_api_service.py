@@ -1175,7 +1175,11 @@ def check_embedding(dataset_id: str, tenant_id: str, req: dict):
             cid = ids[0]
             full_doc = docStoreConn.get(cid, index_nm, [kb_id]) or {}
             vec_field = _guess_vec_field(full_doc)
-            vec = _as_float_vec(full_doc.get(vec_field))
+            vec_valid = full_doc.get(f"{vec_field}_valid") if vec_field else None
+            if callable(getattr(docStoreConn, "db_type", None)) and docStoreConn.db_type() == "gaussdb" and vec_valid is False:
+                vec = []
+            else:
+                vec = _as_float_vec(full_doc.get(vec_field))
 
             out.append({
                 "chunk_id": cid,
