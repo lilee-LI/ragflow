@@ -23,11 +23,13 @@ from typing import Any, Iterable
 from pydantic import BaseModel
 
 from common.constants import PAGERANK_FLD
-from common.doc_store.gaussdb_conn_base import GaussDBConnectionBase, GaussDBSearchBuilder
+from common.doc_store.doc_store_base import FusionExpr, MatchDenseExpr, MatchTextExpr
+from common.doc_store.gaussdb_conn_base import GaussDBConnectionBase, GaussDBSQLValidator, GaussDBSearchBuilder
 from common.doc_store.gaussdb_conn_pool import GaussDBError
 
 logger = logging.getLogger("ragflow.gaussdb_conn")
 
+SQL_QUERY_TIMEOUT_MS = 30000
 VECTOR_COLUMN_RE = re.compile(r"^q_(?P<dim>\d+)_vec$")
 VECTOR_VALID_COLUMN_RE = re.compile(r"^q_(?P<dim>\d+)_vec_valid$")
 
@@ -355,6 +357,32 @@ class GaussDBConnection(GaussDBConnectionBase):
             if value is not None:
                 doc_ids.append(str(value))
         return doc_ids
+
+    def sql(self, sql: str, fetch_size: int = 128, format: str = "json"):
+        self.logger.debug("GaussDBConnection.sql get sql: %s", sql)
+        fetch_size = int(fetch_size or 128)
+        validated = GaussDBSQLValidator.readonly_guard(default_limit=fetch_size).validate_and_patch(sql)
+        rows, description = self._fetch_all_with_description(validated.sql, [], statement_timeout_ms=SQL_QUERY_TIMEOUT_MS)
+        columns = [desc[0] for desc in description]
+
+        def coerce_value(value):
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="ignore")
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, ensure_ascii=False)
+            return value
+
+        rows_list = [[coerce_value(value) for value in list(row)] for row in rows or []]
+        result = {
+            "columns": [{"name": column, "type": "text"} for column in columns],
+            "rows": rows_list,
+        }
+        if format == "markdown":
+            header = "|" + "|".join(columns) + "|" if columns else ""
+            separator = "|" + "|".join(["---" for _ in columns]) + "|" if columns else ""
+            body = "\n".join(["|" + "|".join([str(value) for value in row]) + "|" for row in rows_list])
+            result["markdown"] = "\n".join([line for line in [header, separator, body] if line])
+        return result
 
     def get_total(self, res) -> int:
         return int(res.total)

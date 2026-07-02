@@ -52,6 +52,38 @@ from rag.utils.tavily_conn import Tavily
 from rag.utils.tts_cache import synthesize_with_cache
 from common.string_utils import remove_redundant_spaces
 from common import settings
+from common.doc_store.gaussdb_conn_base import ExposedGaussDBTable, GaussDBSQLValidator, jsonb_path_literal
+
+
+def _build_gaussdb_sql_prompt(table_name, field_map, question):
+    field_lines = []
+    for field, field_type in (field_map or {}).items():
+        path = jsonb_path_literal(tuple(part for part in str(field).split(".") if part))
+        field_lines.append(f"  - {field} ({field_type}): chunk_data #>> {path}")
+    return """You are a Database Administrator. Write SQL for GaussDB A/ORA mode for a table with JSONB 'chunk_data' column.
+
+Table: {table_name}
+JSONB text extraction: chunk_data #>> '{{FieldName}}'
+JSONB value extraction: chunk_data #> '{{FieldName}}'
+Numeric cast: CAST(chunk_data #>> '{{FieldName}}' AS DOUBLE PRECISION)
+Date cast: to_date(chunk_data #>> '{{FieldName}}', 'YYYY-MM-DD')
+NULL check: (chunk_data #>> '{{FieldName}}') IS NOT NULL
+
+RULES:
+1. Use only the table and fields listed below.
+2. Include doc_id and docnm_kwd for non-aggregate data queries.
+3. Restrict the query by kb_id.
+4. Do not use non-GaussDB JSON helper functions, SELECT *, DML, DDL, CALL, or system functions.
+5. Output only one SQL statement.
+
+Fields:
+{fields}
+
+Question: {question}""".format(
+        table_name=table_name,
+        fields="\n".join(field_lines),
+        question=question,
+    )
 
 def _chunk_kb_id_for_doc(row_dict, kb_ids, doc_id):
     if len(kb_ids or []) == 1:
@@ -959,6 +991,8 @@ async def use_sql(question, field_map, tenant_id, chat_mdl, quota=True, kb_ids=N
         doc_engine = "infinity"
     elif settings.DOC_ENGINE_OCEANBASE:
         doc_engine = "oceanbase"
+    elif getattr(settings, "DOC_ENGINE_GAUSSDB", False):
+        doc_engine = "gaussdb"
     else:
         doc_engine = "es"
 
@@ -984,6 +1018,15 @@ async def use_sql(question, field_map, tenant_id, chat_mdl, quota=True, kb_ids=N
         logging.debug(f"use_sql: Using ES/OS table name: {table_name}")
 
     expected_doc_name_column = "docnm" if doc_engine == "infinity" else "docnm_kwd"
+    if doc_engine == "gaussdb":
+        if not kb_ids:
+            raise ValueError("GaussDB Text-to-SQL requires kb_ids")
+        for kid in kb_ids:
+            _assert_valid_uuid(kid, "kb_id")
+        gaussdb_table = ExposedGaussDBTable.from_field_map(table_name, kb_ids, field_map)
+        gaussdb_validator = GaussDBSQLValidator({gaussdb_table.logical_name: gaussdb_table}, default_limit=128)
+    else:
+        gaussdb_validator = None
 
     def has_source_columns(columns):
         """Return True if the result set contains the columns needed to build source citations."""
@@ -1018,7 +1061,7 @@ async def use_sql(question, field_map, tenant_id, chat_mdl, quota=True, kb_ids=N
         canonical UUIDs before interpolation to prevent SQL injection.
         """
         # Add kb_id filter for ES/OS only (Infinity already has it in table name)
-        if doc_engine == "infinity" or not kb_ids:
+        if doc_engine in ("infinity", "gaussdb") or not kb_ids:
             return sql
 
         # Validate all kb_ids are UUIDs before interpolating into SQL
@@ -1109,6 +1152,22 @@ Question: {}
 Write SQL using json_extract_string() with exact field names. Include doc_id, docnm_kwd for data queries. Only SQL.""".format(
             table_name, ", ".join(json_field_names), "\n".join([f"  - {field}" for field in json_field_names]), question
         )
+    elif doc_engine == "gaussdb":
+        row_count_override = f"SELECT COUNT(*) AS rows FROM {table_name}" if is_row_count_question(question) else None
+        field_lines = [
+            f"  - {field} ({field_type}): chunk_data #>> {jsonb_path_literal(tuple(part for part in str(field).split('.') if part))}"
+            for field, field_type in field_map.items()
+        ]
+        sys_prompt = _build_gaussdb_sql_prompt(table_name, field_map, question)
+        user_prompt = """Table: {}
+Fields:
+{}
+Question: {}
+Write SQL using GaussDB JSONB #>> / #> syntax. Include doc_id and docnm_kwd for data queries. Only SQL.""".format(
+            table_name,
+            "\n".join(field_lines),
+            question,
+        )
     else:
         # Build ES/OS prompts with direct field access
         row_count_override = None
@@ -1138,6 +1197,8 @@ Write SQL using exact field names above. Include doc_id, docnm_kwd for data quer
             sql = await chat_mdl.async_chat(sys_prompt, [{"role": "user", "content": prompt}], {"temperature": 0.06})
         sql = normalize_sql(sql)
         sql = add_kb_filter(sql)
+        if doc_engine == "gaussdb":
+            sql = gaussdb_validator.validate_and_patch(sql).sql
 
         logging.debug(f"{question} get SQL(refined): {sql}")
         tried_times += 1
@@ -1154,7 +1215,25 @@ Write SQL using exact field names above. Include doc_id, docnm_kwd for data quer
         return tbl, sql
 
     async def repair_table_for_missing_source_columns(previous_sql):
-        if doc_engine in ("infinity", "oceanbase"):
+        if doc_engine == "gaussdb":
+            field_lines = [
+                f"  - {field}: chunk_data #>> {jsonb_path_literal(tuple(part for part in str(field).split('.') if part))}"
+                for field in field_map
+            ]
+            repair_prompt = """Table name: {};
+GaussDB JSONB fields available in chunk_data:
+{}
+
+Question: {}
+Previous SQL:
+{}
+
+The previous SQL result is missing required source columns for citations.
+Rewrite SQL to keep the same query intent and include doc_id and docnm_kwd in the SELECT list.
+Use chunk_data #>> '{{field}}' or chunk_data #> '{{field}}' for JSONB fields.
+For date fields, use to_date(chunk_data #>> '{{field}}', 'YYYY-MM-DD').
+Return ONLY SQL.""".format(table_name, "\n".join(field_lines), question, previous_sql)
+        elif doc_engine in ("infinity", "oceanbase"):
             json_field_names = list(field_map.keys())
             repair_prompt = """Table name: {};
 JSON fields available in 'chunk_data' column (use exact names):
@@ -1189,7 +1268,26 @@ Return ONLY SQL.""".format(table_name, "\n".join([f"  - {k} ({v})" for k, v in f
     except Exception as e:
         logging.warning(f"use_sql: Initial SQL execution FAILED with error: {e}")
         # Build retry prompt with error information
-        if doc_engine in ("infinity", "oceanbase"):
+        if doc_engine == "gaussdb":
+            field_lines = [
+                f"  - {field}: chunk_data #>> {jsonb_path_literal(tuple(part for part in str(field).split('.') if part))}"
+                for field in field_map
+            ]
+            user_prompt = """
+Table name: {};
+GaussDB JSONB fields available in chunk_data:
+{}
+
+Question: {}
+Please write SQL using chunk_data #>> '{{field}}' / chunk_data #> '{{field}}' syntax. Include doc_id and docnm_kwd for data queries. Only SQL.
+For date fields, use to_date(chunk_data #>> '{{field}}', 'YYYY-MM-DD').
+
+The previous SQL error is:
+{}
+
+Correct the SQL for GaussDB A/ORA mode. Do not use json_extract_string, json_extract, json_extract_isnull, SELECT *, DML, DDL, CALL, or system functions. Only SQL.
+""".format(table_name, "\n".join(field_lines), question, e)
+        elif doc_engine in ("infinity", "oceanbase"):
             # Build Infinity error retry prompt
             json_field_names = list(field_map.keys())
             user_prompt = """
@@ -1356,6 +1454,8 @@ Please correct the error and write SQL again using json_extract_string(chunk_dat
                 # Add LIMIT to avoid fetching too many chunks
                 if "limit" not in chunks_sql.lower():
                     chunks_sql += " limit 20"
+                if doc_engine == "gaussdb":
+                    chunks_sql = gaussdb_validator.validate_and_patch(chunks_sql).sql
                 logging.debug(f"use_sql: Fetching chunks with SQL: {chunks_sql}")
                 try:
                     chunks_tbl = settings.retriever.sql_retrieval(chunks_sql, format="json")
