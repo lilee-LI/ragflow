@@ -359,6 +359,8 @@ def test_insert_doc_meta_uses_parameterized_upsert():
     assert 'INSERT INTO "public"."ragflow_doc_meta_tenant"' in sql
     assert "(id, kb_id, meta_fields)" in sql
     assert "%s::jsonb" in sql
+    assert "kb_id = VALUES(kb_id)" not in sql
+    assert "meta_fields = VALUES(meta_fields)" in sql
     assert params == [["doc1", "kb1", '{"author": "Alice"}']]
 
 

@@ -174,17 +174,56 @@ class GaussDBConnection(GaussDBConnectionBase):
             return [doc_id for doc_id in ids if doc_id] or [str(exc)]
 
     def get(self, chunk_id: str, index_name: str, knowledgebase_ids: list[str]) -> dict | None:
-        if not chunk_id or not knowledgebase_ids:
+        if not chunk_id:
+            return None
+        is_meta = is_doc_meta_table(index_name)
+        kb_ids = normalize_kb_ids(knowledgebase_ids)
+        if not is_meta and not kb_ids:
             return None
         if not self.index_exist(index_name):
             return None
         table = self.ddl.qualified_name(index_name)
-        placeholders = ", ".join(["%s"] * len(knowledgebase_ids))
-        sql = f"SELECT * FROM {table} WHERE id = %s AND kb_id IN ({placeholders}) LIMIT 1"
-        row, description = self._fetch_one_with_description(sql, [chunk_id, *knowledgebase_ids])
+        params = [chunk_id]
+        where = "id = %s"
+        if kb_ids:
+            placeholders = ", ".join(["%s"] * len(kb_ids))
+            where += f" AND kb_id IN ({placeholders})"
+            params.extend(kb_ids)
+        sql = f"SELECT * FROM {table} WHERE {where} LIMIT 1"
+        row, description = self._fetch_one_with_description(sql, params)
         if row is None:
             return None
         return self._row_to_chunk(row, description)
+
+    def search(
+        self,
+        select_fields: list[str],
+        highlight_fields: list[str],
+        condition: dict,
+        match_expressions: list,
+        order_by,
+        offset: int,
+        limit: int,
+        index_names: str | list[str],
+        knowledgebase_ids: list[str] | None = None,
+        agg_fields: list[str] | None = None,
+        rank_feature: dict | None = None,
+        **kwargs,
+    ) -> SearchResult:
+        if knowledgebase_ids is None:
+            knowledgebase_ids = kwargs.get("dataset_ids") or []
+        tables = normalize_table_names(index_names)
+        if len(tables) == 1 and is_doc_meta_table(tables[0]) and not match_expressions and not agg_fields:
+            return self._search_doc_meta_table(
+                select_fields=select_fields,
+                condition=condition,
+                order_by=order_by,
+                offset=offset,
+                limit=limit,
+                index_name=tables[0],
+                knowledgebase_ids=knowledgebase_ids,
+            )
+        raise NotImplementedError("GaussDB chunk search is implemented in the search task")
 
     def update(self, condition: dict, new_value: dict, index_name: str, knowledgebase_id: str) -> bool:
         if not condition or not new_value:
@@ -223,6 +262,40 @@ class GaussDBConnection(GaussDBConnectionBase):
         except Exception as exc:
             logger.error("GaussDB delete failed for table=%s condition=%s error=%s", index_name, condition, exc)
             return 0
+
+    def fetch_metadata_doc_ids(
+        self,
+        index_name: str,
+        kb_ids: list[str],
+        sql_filter: str,
+        filter_params: list[Any],
+        limit: int,
+    ) -> list[str]:
+        if not is_doc_meta_table(index_name):
+            raise ValueError(f"invalid GaussDB document metadata table name: {index_name}")
+        scoped_kb_ids = normalize_kb_ids(kb_ids)
+        if not scoped_kb_ids or not sql_filter:
+            return []
+        table = self.ddl.qualified_name(index_name)
+        placeholders = ", ".join(["%s"] * len(scoped_kb_ids))
+        effective_limit = limit if limit and limit > 0 else 10000
+        sql = (
+            f"SELECT id FROM {table} "
+            f"WHERE kb_id IN ({placeholders}) AND ({sql_filter}) "
+            "ORDER BY id LIMIT %s"
+        )
+        rows = self._fetch_all(sql, [*scoped_kb_ids, *(filter_params or []), effective_limit])
+        doc_ids = []
+        for row in rows or []:
+            if isinstance(row, dict):
+                value = row.get("id")
+            elif isinstance(row, (list, tuple)) and row:
+                value = row[0]
+            else:
+                value = None
+            if value is not None:
+                doc_ids.append(str(value))
+        return doc_ids
 
     def get_total(self, res) -> int:
         return int(res.total)
@@ -419,9 +492,50 @@ class GaussDBConnection(GaussDBConnectionBase):
         sql = (
             f"INSERT INTO {table} (id, kb_id, meta_fields) "
             "VALUES (%s, %s, %s::jsonb) "
-            "ON DUPLICATE KEY UPDATE kb_id = VALUES(kb_id), meta_fields = VALUES(meta_fields)"
+            "ON DUPLICATE KEY UPDATE meta_fields = VALUES(meta_fields)"
         )
         return sql, params
+
+    def _search_doc_meta_table(
+        self,
+        select_fields: list[str],
+        condition: dict,
+        order_by,
+        offset: int,
+        limit: int,
+        index_name: str,
+        knowledgebase_ids: list[str],
+    ) -> SearchResult:
+        table = self.ddl.qualified_name(index_name)
+        columns = select_doc_meta_columns(select_fields)
+        effective_condition = dict(condition or {})
+        kb_ids = normalize_kb_ids(knowledgebase_ids)
+        if kb_ids and "kb_id" not in effective_condition:
+            effective_condition["kb_id"] = kb_ids
+        where_sql, where_params = self._build_where_clause(effective_condition, None, is_meta=True)
+        sql = f"SELECT {', '.join(columns)}, COUNT(*) OVER() AS __total FROM {table}"
+        if where_sql:
+            sql += f" WHERE {where_sql}"
+        order_sql = build_doc_meta_order_by(order_by)
+        if order_sql:
+            sql += f" ORDER BY {order_sql}"
+        effective_limit = limit if limit and limit > 0 else 10000
+        effective_offset = max(int(offset or 0), 0)
+        sql += " LIMIT %s OFFSET %s"
+        rows, description = self._fetch_all_with_description(sql, [*where_params, effective_limit, effective_offset])
+        total = 0
+        chunks = []
+        for row in rows or []:
+            chunk = self._row_to_chunk(row, description)
+            total = int(chunk.pop("__total", total or 0) or 0)
+            chunks.append(chunk)
+        if not chunks and effective_offset:
+            count_sql = f"SELECT COUNT(*) FROM {table}"
+            if where_sql:
+                count_sql += f" WHERE {where_sql}"
+            row = self._fetch_one(count_sql, where_params)
+            total = int(row[0]) if row else 0
+        return SearchResult(total=total, chunks=chunks)
 
     def _build_set_clause(self, new_value: dict, is_meta: bool, condition: dict) -> tuple[str, list[Any]]:
         fragments = []
@@ -605,6 +719,17 @@ class GaussDBConnection(GaussDBConnectionBase):
             close_cursor(cur)
             self.pool.put_conn(conn)
 
+    def _fetch_all_with_description(self, sql: str, params: list[Any]):
+        conn = self.pool.get_conn()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            return cur.fetchall(), getattr(cur, "description", None) or []
+        finally:
+            close_cursor(cur)
+            self.pool.put_conn(conn)
+
 
 def is_doc_meta_table(index_name: str) -> bool:
     return str(index_name or "").startswith("ragflow_doc_meta_")
@@ -616,6 +741,52 @@ def normalize_kb_id(value) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def normalize_kb_ids(values) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, (str, bytes)):
+        raw_values = [values]
+    else:
+        raw_values = list(values)
+    normalized = []
+    seen = set()
+    for value in raw_values:
+        if value in (None, ""):
+            continue
+        text = str(value)
+        if text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+    return normalized
+
+
+def normalize_table_names(index_names: str | list[str]) -> list[str]:
+    if isinstance(index_names, str):
+        return [name.strip() for name in index_names.split(",") if name.strip()]
+    return [str(name).strip() for name in index_names or [] if str(name).strip()]
+
+
+def select_doc_meta_columns(select_fields: list[str]) -> list[str]:
+    if not select_fields or "*" in select_fields:
+        return list(DOC_META_COLUMNS)
+    columns = []
+    for field in select_fields:
+        validate_filter_column(field, is_meta=True)
+        if field not in columns:
+            columns.append(field)
+    return columns
+
+
+def build_doc_meta_order_by(order_by) -> str:
+    fields = getattr(order_by, "fields", None) or []
+    parts = []
+    for field, direction in fields:
+        validate_filter_column(field, is_meta=True)
+        parts.append(f"{field} {'DESC' if direction else 'ASC'}")
+    return ", ".join(parts)
 
 
 def normalize_column_value(column: str, value: Any) -> Any:

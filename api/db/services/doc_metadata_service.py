@@ -271,6 +271,10 @@ class DocMetadataService:
                     total_count = total_hits.get('value', len(page_docs))
                 else:
                     total_count = total_hits if total_hits else len(page_docs)
+            # Handle GaussDB/OceanBase SearchResult(total, chunks) format
+            elif hasattr(results, 'chunks') and hasattr(results, 'total'):
+                page_docs = list(results.chunks or [])
+                total_count = results.total
             # Handle list/iterable results
             elif hasattr(results, '__iter__') and not isinstance(results, dict):
                 page_docs = list(results)
@@ -480,6 +484,21 @@ class DocMetadataService:
 
             logging.debug(
                 f"[update_document_metadata] Updating doc_id: {doc_id}, kb_id: {kb_id}, meta_fields: {processed_meta}")
+
+            if settings.DOC_ENGINE_GAUSSDB:
+                result = settings.docStoreConn.create_doc_meta_idx(index_name)
+                if result is False:
+                    logging.error(f"Failed to create metadata index {index_name}")
+                    return False
+                insert_errors = settings.docStoreConn.insert(
+                    [{"id": doc_id, "kb_id": kb_id, "meta_fields": processed_meta}],
+                    index_name,
+                    kb_id,
+                )
+                if insert_errors:
+                    logging.error(f"Failed to update metadata for document {doc_id}: {insert_errors}")
+                    return False
+                return True
 
             # For Elasticsearch, use efficient partial update
             if not settings.DOC_ENGINE_INFINITY and not settings.DOC_ENGINE_OCEANBASE:
@@ -877,7 +896,11 @@ class DocMetadataService:
         if not settings.docStoreConn.index_exist(index_name, ""):
             return []
 
-        if settings.DOC_ENGINE_INFINITY:
+        if settings.DOC_ENGINE_GAUSSDB:
+            return cls._filter_doc_ids_by_metadata_gaussdb(
+                index_name, kb_ids, filters, logic, limit
+            )
+        elif settings.DOC_ENGINE_INFINITY:
             return cls._filter_doc_ids_by_metadata_infinity(
                 index_name, kb_ids, filters, logic
             )
@@ -963,6 +986,59 @@ class DocMetadataService:
             return None
 
         logging.debug(f"ES metadata filter returned {len(unique)} matches for KBs {kb_ids}")
+        return unique
+
+    @classmethod
+    def _filter_doc_ids_by_metadata_gaussdb(
+            cls,
+            index_name: str,
+            kb_ids: List[str],
+            filters: List[Dict],
+            logic: str,
+            limit: int,
+    ) -> Optional[List[str]]:
+        """GaussDB push-down path for metadata filtering."""
+        from common.metadata_gaussdb_filter import (
+            UnsupportedGaussDBMetaFilter,
+            build_gaussdb_filter,
+            is_pushdown_supported,
+        )
+
+        if not is_pushdown_supported(filters):
+            return None
+
+        try:
+            sql_filter, filter_params = build_gaussdb_filter(filters, logic)
+        except UnsupportedGaussDBMetaFilter as e:
+            logging.error(f"GaussDB build metadata filter failed: {e}, filters={filters}")
+            return None
+
+        fetch_doc_ids = getattr(settings.docStoreConn, "fetch_metadata_doc_ids", None)
+        if not callable(fetch_doc_ids):
+            return None
+
+        try:
+            doc_ids = fetch_doc_ids(index_name, kb_ids, sql_filter, filter_params, limit)
+        except Exception:
+            logging.warning("GaussDB metadata filter push-down failed; falling back to in-memory filter", exc_info=True)
+            return None
+
+        seen: set[str] = set()
+        unique: List[str] = []
+        for did in doc_ids:
+            if did in seen:
+                continue
+            seen.add(did)
+            unique.append(did)
+
+        if limit and len(unique) >= limit:
+            logging.warning(
+                f"GaussDB metadata filter hit push-down cap, falling back to in-memory: "
+                f"cap={limit}, kb_ids={kb_ids}"
+            )
+            return None
+
+        logging.debug(f"GaussDB metadata filter returned {len(unique)} matches for KBs {kb_ids}")
         return unique
 
     @classmethod
