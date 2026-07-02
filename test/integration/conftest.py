@@ -61,7 +61,7 @@ def _install_settings_import_stubs(monkeypatch):
         "gcs_conn": {"RAGFlowGCS": StubStorage},
         "minio_conn": {"RAGFlowMinio": StubStorage},
         "opendal_conn": {"OpenDALStorage": StubStorage},
-        "redis_conn": {"REDIS_CONN": types.SimpleNamespace(health=lambda: True)},
+        "redis_conn": {"REDIS_CONN": types.SimpleNamespace(health=lambda: True, is_alive=lambda: False, REDIS=None)},
         "s3_conn": {"RAGFlowS3": StubStorage},
         "oss_conn": {"RAGFlowOSS": StubStorage},
     }
@@ -195,7 +195,9 @@ def gaussdb_env(monkeypatch):
     from common import settings
 
     configured_schema = os.getenv("GAUSSDB_SCHEMA")
-    schema = configured_schema or "public"
+    if not configured_schema:
+        pytest.fail("set GAUSSDB_SCHEMA to the pre-created integration schema")
+    schema = configured_schema
     table_prefix = uuid.uuid4().hex
     _assert_schema_access(schema)
 

@@ -14,9 +14,12 @@
 #  limitations under the License.
 #
 import hashlib
+import json
 import logging
 import re
+from dataclasses import dataclass
 from timeit import default_timer as timer
+from typing import Any
 
 from common.doc_store.doc_store_base import DocStoreConnection, MatchExpr, OrderByExpr
 from common.doc_store.gaussdb_conn_pool import GaussDBConnectionError, GaussDBConnectionPool
@@ -24,6 +27,659 @@ from common.doc_store.gaussdb_conn_pool import GaussDBConnectionError, GaussDBCo
 
 class InvalidGaussDBObjectName(ValueError):
     pass
+
+
+class UnsafeGaussDBSQL(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class ExposedGaussDBTable:
+    logical_name: str
+    physical_name: str
+    allowed_columns: frozenset[str]
+    json_fields: dict[str, tuple[str, ...]]
+    required_kb_ids: tuple[str, ...]
+
+    @classmethod
+    def from_field_map(cls, physical_name: str, kb_ids: list[str] | tuple[str, ...], field_map: dict[str, Any]):
+        json_fields = {}
+        for field in field_map or {}:
+            parts = tuple(part for part in str(field).split(".") if part)
+            if parts:
+                json_fields[str(field)] = parts
+        return cls(
+            logical_name=physical_name,
+            physical_name=physical_name,
+            allowed_columns=frozenset({"doc_id", "docnm_kwd", "kb_id", "chunk_data"}),
+            json_fields=json_fields,
+            required_kb_ids=tuple(str(kid) for kid in kb_ids or () if str(kid)),
+        )
+
+
+@dataclass(frozen=True)
+class ValidatedGaussDBSQL:
+    sql: str
+    columns: list[str] | None = None
+    is_aggregation: bool = False
+
+
+def jsonb_path_literal(parts: list[str] | tuple[str, ...]) -> str:
+    if not parts:
+        raise UnsafeGaussDBSQL("empty JSONB path")
+    encoded = []
+    for part in parts:
+        segment = str(part)
+        if not segment:
+            raise UnsafeGaussDBSQL("empty JSONB path segment")
+        if re.fullmatch(r"[A-Za-z0-9_]+", segment):
+            encoded.append(segment)
+        else:
+            escaped = segment.replace("\\", "\\\\").replace('"', '\\"')
+            encoded.append(f'"{escaped}"')
+    return "'{" + ",".join(encoded) + "}'"
+
+
+def _parse_jsonb_path_literal(value: str) -> tuple[str, ...]:
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == "'" and text[-1] == "'":
+        text = text[1:-1]
+    if not (text.startswith("{") and text.endswith("}")):
+        raise UnsafeGaussDBSQL("dynamic JSONB path is not allowed")
+    body = text[1:-1]
+    parts: list[str] = []
+    buf: list[str] = []
+    quoted = False
+    escaped = False
+    for char in body:
+        if escaped:
+            buf.append(char)
+            escaped = False
+            continue
+        if quoted and char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            quoted = not quoted
+            continue
+        if char == "," and not quoted:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(char)
+    if quoted:
+        raise UnsafeGaussDBSQL("invalid JSONB path literal")
+    parts.append("".join(buf))
+    if not parts or any(part == "" for part in parts):
+        raise UnsafeGaussDBSQL("invalid JSONB path literal")
+    return tuple(parts)
+
+
+class GaussDBSQLValidator:
+    PARSE_DIALECT = "postgres"
+    FORBIDDEN_RE = re.compile(
+        r"\b(delete|update|insert|drop|alter|create|truncate|merge|copy|grant|revoke|call|execute|do|vacuum|analyze|set)\b",
+        re.IGNORECASE,
+    )
+    FORBIDDEN_FUNCTIONS = {
+        "pg_sleep",
+        "sleep",
+        "now",
+        "current_user",
+        "current_date",
+        "current_time",
+        "current_timestamp",
+        "current_database",
+        "current_catalog",
+        "localtime",
+        "localtimestamp",
+        "session_user",
+        "user",
+        "version",
+        "current_schema",
+        "json_extract",
+        "json_extract_string",
+        "json_extract_isnull",
+        "jsonb_each",
+        "jsonb_each_text",
+        "jsonb_array_elements",
+        "jsonb_array_elements_text",
+    }
+    ALLOWED_FUNCTIONS = {"to_date"}
+    AGGREGATE_RE = re.compile(r"\b(count|sum|avg|max|min)\s*\(", re.IGNORECASE)
+    SYSTEM_FUNCTION_RE = re.compile(
+        r"\b(now|current_user|current_date|current_time|current_timestamp|current_database|current_catalog|localtime|localtimestamp|session_user|user|version|current_schema)\s*(?:\(|\b)",
+        re.IGNORECASE,
+    )
+
+    def __init__(
+        self,
+        tables: dict[str, ExposedGaussDBTable] | set[str] | list[str] | tuple[str, ...] | None = None,
+        kb_ids: list[str] | tuple[str, ...] | None = None,
+        default_limit: int = 128,
+        readonly_only: bool = False,
+        runtime_readonly_guard: bool = False,
+    ):
+        if tables is None:
+            self.tables = {}
+        elif isinstance(tables, dict):
+            self.tables = dict(tables)
+        else:
+            self.tables = {
+                str(table): ExposedGaussDBTable.from_field_map(str(table), kb_ids or (), {})
+                for table in tables
+            }
+        self.default_limit = int(default_limit or 128)
+        self.readonly_only = readonly_only
+        self.runtime_readonly_guard = runtime_readonly_guard
+
+    @classmethod
+    def readonly_guard(cls, default_limit: int = 128):
+        return cls(default_limit=default_limit, readonly_only=True, runtime_readonly_guard=True)
+
+    def validate_and_patch(self, raw_sql: str) -> ValidatedGaussDBSQL:
+        sql = self.normalize_sql(raw_sql)
+        ast = self._parse_one(sql)
+        self._validate_readonly_ast(ast)
+        if self.runtime_readonly_guard:
+            self._validate_runtime_readonly_context(ast)
+        if not self.readonly_only:
+            self._validate_tables(ast)
+            self._validate_columns(ast)
+            self._validate_jsonb_paths(ast)
+            sql = self._enforce_kb_boundary(sql)
+            ast = self._parse_one(sql)
+            self._validate_tables(ast)
+            self._validate_columns(ast)
+            self._validate_jsonb_paths(ast)
+        sql = self._enforce_limit(sql)
+        ast = self._parse_one(sql)
+        self._validate_readonly_ast(ast)
+        if self.runtime_readonly_guard:
+            self._validate_runtime_readonly_context(ast)
+        if not self.readonly_only:
+            self._validate_tables(ast)
+            self._validate_columns(ast)
+            self._validate_jsonb_paths(ast)
+        return ValidatedGaussDBSQL(
+            sql=sql,
+            columns=self._select_columns(ast),
+            is_aggregation=bool(self.AGGREGATE_RE.search(sql)),
+        )
+
+    def normalize_sql(self, raw_sql: str) -> str:
+        sql = str(raw_sql or "").strip()
+        sql = re.sub(r"</think>\s*.*?\s*", "", sql, flags=re.DOTALL)
+        sql = re.sub(r"```(?:sql)?\s*", "", sql, flags=re.IGNORECASE)
+        sql = re.sub(r"```\s*$", "", sql, flags=re.IGNORECASE)
+        sql = sql.strip().strip("`").strip().rstrip(";").strip()
+        if not sql:
+            raise UnsafeGaussDBSQL("empty SQL")
+        if ";" in sql:
+            raise UnsafeGaussDBSQL("multiple statements are not allowed")
+        return sql
+
+    def _parse_one(self, sql: str):
+        try:
+            from sqlglot import exp, parse
+            from sqlglot.errors import ParseError
+        except Exception as exc:
+            raise UnsafeGaussDBSQL("sqlglot is required for GaussDB SQL validation") from exc
+        try:
+            expressions = parse(sql, read=self.PARSE_DIALECT)
+        except ParseError as exc:
+            raise UnsafeGaussDBSQL("SQL parse failed") from exc
+        if len(expressions) != 1:
+            raise UnsafeGaussDBSQL("exactly one SQL statement is allowed")
+        if not isinstance(expressions[0], exp.Select):
+            raise UnsafeGaussDBSQL("only SELECT statements are allowed")
+        return expressions[0]
+
+    def _validate_readonly_ast(self, ast) -> None:
+        from sqlglot import exp
+
+        forbidden_types = (
+            exp.Delete,
+            exp.Update,
+            exp.Insert,
+            exp.Create,
+            exp.Drop,
+            exp.Command,
+        )
+        if any(isinstance(node, forbidden_types) for node in ast.walk()):
+            raise UnsafeGaussDBSQL("SQL contains a non-read-only expression")
+        forbidden_system_types = tuple(
+            cls
+            for cls in (
+                getattr(exp, "CurrentUser", None),
+                getattr(exp, "CurrentDate", None),
+                getattr(exp, "CurrentTime", None),
+                getattr(exp, "CurrentTimestamp", None),
+                getattr(exp, "CurrentDatabase", None),
+                getattr(exp, "CurrentCatalog", None),
+                getattr(exp, "CurrentSchema", None),
+            )
+            if cls
+        )
+        for node in ast.walk():
+            if isinstance(node, exp.Star) and not isinstance(getattr(node, "parent", None), exp.Count):
+                raise UnsafeGaussDBSQL("SELECT * is not allowed")
+            if isinstance(node, exp.Window):
+                raise UnsafeGaussDBSQL("window functions are not allowed")
+            if isinstance(node, forbidden_system_types):
+                raise UnsafeGaussDBSQL("system functions are not allowed")
+        allowed_func_types = tuple(
+            cls
+            for cls in (
+                exp.Count,
+                exp.Sum,
+                exp.Avg,
+                exp.Max,
+                exp.Min,
+                exp.Cast,
+                getattr(exp, "StrToDate", None),
+                getattr(exp, "JSONBExtractScalar", None),
+                getattr(exp, "JSONBExtract", None),
+            )
+            if cls
+        )
+        for node in ast.find_all(exp.Func):
+            if isinstance(node, (exp.Binary, exp.Connector, exp.Predicate)) and not isinstance(node, allowed_func_types):
+                continue
+            name = str(getattr(node, "name", "") or node.__class__.__name__).lower()
+            if isinstance(node, forbidden_system_types) or name in self.FORBIDDEN_FUNCTIONS:
+                raise UnsafeGaussDBSQL(f"function {name} is not allowed")
+            if not isinstance(node, allowed_func_types):
+                raise UnsafeGaussDBSQL(f"function {name} is not allowed")
+
+    def _validate_runtime_readonly_context(self, ast) -> None:
+        from sqlglot import exp
+
+        base_tables = self._base_tables(ast)
+        if not base_tables:
+            raise UnsafeGaussDBSQL("SQL must read from a DocEngine table")
+        for table in base_tables:
+            if not re.fullmatch(r"ragflow_[A-Za-z0-9_]{1,56}", table):
+                raise UnsafeGaussDBSQL(f"table {table} is not allowed")
+        if self._has_complex_boundary(ast.sql(dialect=self.PARSE_DIALECT)):
+            raise UnsafeGaussDBSQL("complex SQL must use a simpler single-table kb_id boundary")
+        for select in self._selects_with_base_tables(ast):
+            if not self._select_has_static_kb_boundary(select):
+                raise UnsafeGaussDBSQL("each base table scope must include a static kb_id boundary")
+        self._validate_runtime_columns(ast)
+        self._validate_jsonb_paths(ast)
+
+    def _validate_runtime_columns(self, ast) -> None:
+        from sqlglot import exp
+
+        allowed_columns = {"doc_id", "docnm_kwd", "kb_id", "chunk_data"}
+        cte_outputs = self._cte_output_columns(ast)
+        select_alias_refs = self._select_alias_reference_columns(ast)
+        for column in ast.find_all(exp.Column):
+            name = column.name
+            if name in allowed_columns:
+                continue
+            if self._is_cte_output_column(column, cte_outputs):
+                continue
+            if id(column) in select_alias_refs:
+                continue
+            raise UnsafeGaussDBSQL(f"column {name} is not allowed")
+
+    def _cte_names(self, ast) -> set[str]:
+        from sqlglot import exp
+
+        return {cte.alias_or_name for cte in ast.find_all(exp.CTE) if cte.alias_or_name}
+
+    def _base_tables(self, ast) -> list[str]:
+        from sqlglot import exp
+
+        cte_names = self._cte_names(ast)
+        tables = []
+        for table in ast.find_all(exp.Table):
+            if table.db or table.catalog:
+                raise UnsafeGaussDBSQL("cross-schema SQL is not allowed")
+            name = table.name
+            if name and name not in cte_names:
+                tables.append(name)
+        return tables
+
+    def _validate_tables(self, ast) -> None:
+        allowed = {table.physical_name for table in self.tables.values()} | set(self.tables)
+        for table in self._base_tables(ast):
+            if table not in allowed:
+                raise UnsafeGaussDBSQL(f"table {table} is not allowed")
+
+    def _validate_columns(self, ast) -> None:
+        from sqlglot import exp
+
+        allowed_columns = set()
+        for table in self.tables.values():
+            allowed_columns.update(table.allowed_columns)
+        cte_outputs = self._cte_output_columns(ast)
+        select_alias_refs = self._select_alias_reference_columns(ast)
+        for column in ast.find_all(exp.Column):
+            name = column.name
+            if name in allowed_columns:
+                continue
+            if self._is_cte_output_column(column, cte_outputs):
+                continue
+            if id(column) in select_alias_refs:
+                continue
+            raise UnsafeGaussDBSQL(f"column {name} is not allowed")
+
+    def _select_alias_reference_columns(self, ast) -> set[int]:
+        from sqlglot import exp
+
+        refs = set()
+        for select in ast.find_all(exp.Select):
+            aliases = {
+                str(getattr(expression, "alias_or_name", "") or "")
+                for expression in getattr(select, "expressions", []) or []
+                if getattr(expression, "alias", None)
+            }
+            aliases.discard("")
+            if not aliases:
+                continue
+            for clause_name in ("group", "order"):
+                clause = select.args.get(clause_name)
+                if not clause:
+                    continue
+                for column in clause.find_all(exp.Column):
+                    if not column.table and column.name in aliases:
+                        refs.add(id(column))
+        return refs
+
+    def _cte_output_columns(self, ast) -> dict[str, set[str]]:
+        from sqlglot import exp
+
+        outputs: dict[str, set[str]] = {}
+        for cte in ast.find_all(exp.CTE):
+            name = cte.alias_or_name
+            query = cte.this
+            if not name or not isinstance(query, exp.Select):
+                continue
+            columns = set()
+            for expression in query.expressions or []:
+                alias = getattr(expression, "alias_or_name", None)
+                if alias:
+                    columns.add(str(alias))
+            outputs[name] = columns
+        return outputs
+
+    def _is_cte_output_column(self, column, cte_outputs: dict[str, set[str]]) -> bool:
+        from sqlglot import exp
+
+        name = column.name
+        table = column.table
+        if table:
+            return table in cte_outputs and name in cte_outputs[table]
+        select = column.parent
+        while select is not None and not isinstance(select, exp.Select):
+            select = getattr(select, "parent", None)
+        if select is None:
+            return False
+        source_tables = self._direct_source_tables(select)
+        if not source_tables or not all(source in cte_outputs for source in source_tables):
+            return False
+        return any(name in cte_outputs[source] for source in source_tables)
+
+    def _validate_jsonb_paths(self, ast) -> None:
+        from sqlglot import exp
+
+        allowed_paths = {path for table in self.tables.values() for path in table.json_fields.values()}
+        json_classes = tuple(
+            cls for cls in (getattr(exp, "JSONExtractScalar", None), getattr(exp, "JSONExtract", None)) if cls
+        )
+        jsonb_classes = tuple(
+            cls for cls in (getattr(exp, "JSONBExtractScalar", None), getattr(exp, "JSONBExtract", None)) if cls
+        )
+        allowed_chunk_data_columns = set()
+        for node in ast.walk():
+            if json_classes and isinstance(node, json_classes):
+                raise UnsafeGaussDBSQL("only GaussDB #> / #>> JSONB operators are allowed")
+            if not jsonb_classes:
+                continue
+            if not isinstance(node, jsonb_classes):
+                continue
+            source = node.this
+            if not isinstance(source, exp.Column) or source.name != "chunk_data":
+                raise UnsafeGaussDBSQL("only chunk_data JSONB paths are allowed")
+            allowed_chunk_data_columns.add(id(source))
+            expression = node.expression
+            if not isinstance(expression, exp.Literal) or not expression.is_string:
+                raise UnsafeGaussDBSQL("dynamic JSONB path is not allowed")
+            path = _parse_jsonb_path_literal(expression.this)
+            if not self.readonly_only and not allowed_paths:
+                raise UnsafeGaussDBSQL(f"JSONB path {path} is not exposed")
+            if allowed_paths and path not in allowed_paths:
+                raise UnsafeGaussDBSQL(f"JSONB path {path} is not exposed")
+        for column in ast.find_all(exp.Column):
+            if column.name == "chunk_data" and id(column) not in allowed_chunk_data_columns:
+                raise UnsafeGaussDBSQL("chunk_data may only be accessed through #> / #>>")
+
+    def _required_kb_ids(self) -> tuple[str, ...]:
+        kb_ids = []
+        for table in self.tables.values():
+            kb_ids.extend(table.required_kb_ids)
+        return tuple(dict.fromkeys(kb_ids))
+
+    def _enforce_kb_boundary(self, sql: str) -> str:
+        kb_ids = self._required_kb_ids()
+        if not kb_ids:
+            raise UnsafeGaussDBSQL("kb_id boundary is required")
+        ast = self._parse_one(sql)
+        if not self._base_tables(ast):
+            raise UnsafeGaussDBSQL("SQL must read from an exposed DocEngine table")
+        if self._has_complex_boundary(sql):
+            raise UnsafeGaussDBSQL("complex SQL must use a simpler single-table kb_id boundary")
+        missing = []
+        for select in self._selects_with_base_tables(ast):
+            if self._select_has_allowed_kb_boundary(select, kb_ids):
+                continue
+            missing.append(select)
+        if not missing:
+            return sql
+        if len(missing) == 1 and missing[0] is ast and not ast.args.get("with_") and len(set(self._direct_base_tables(ast))) == 1:
+            if self._where_mentions_kb_id(ast):
+                raise UnsafeGaussDBSQL("kb_id boundary must be a positive top-level predicate")
+            return self._insert_condition(sql, self._kb_condition(kb_ids))
+        if len(set(self._base_tables(ast))) != 1:
+            raise UnsafeGaussDBSQL("SQL must reference exactly one base table to inject kb_id")
+        raise UnsafeGaussDBSQL("each base table scope must include a kb_id boundary")
+
+    def _has_complex_boundary(self, sql: str) -> bool:
+        from sqlglot import exp
+
+        ast = self._parse_one(sql)
+        if any(isinstance(node, exp.Or) for node in ast.walk()):
+            return True
+        if re.search(r"\b(join|union|intersect|except)\b", sql, flags=re.IGNORECASE):
+            return True
+        return False
+
+    def _selects_with_base_tables(self, ast) -> list:
+        from sqlglot import exp
+
+        return [
+            select
+            for select in ast.find_all(exp.Select)
+            if self._direct_base_tables(select)
+        ]
+
+    def _direct_base_tables(self, select) -> list[str]:
+        from sqlglot import exp
+
+        cte_names = self._cte_names(select)
+        tables = []
+        from_expr = select.args.get("from_")
+        if from_expr and isinstance(from_expr.this, exp.Table):
+            if from_expr.this.name not in cte_names:
+                tables.append(from_expr.this.name)
+        for join in select.args.get("joins") or []:
+            target = join.this
+            if isinstance(target, exp.Table) and target.name not in cte_names:
+                tables.append(target.name)
+        return tables
+
+    def _direct_source_tables(self, select) -> list[str]:
+        from sqlglot import exp
+
+        tables = []
+        from_expr = select.args.get("from_")
+        if from_expr and isinstance(from_expr.this, exp.Table):
+            tables.append(from_expr.this.name)
+        for join in select.args.get("joins") or []:
+            target = join.this
+            if isinstance(target, exp.Table):
+                tables.append(target.name)
+        return tables
+
+    def _select_has_allowed_kb_boundary(self, select, allowed_kb_ids: tuple[str, ...]) -> bool:
+        from sqlglot import exp
+
+        where = select.args.get("where")
+        if not where:
+            return False
+        allowed = set(allowed_kb_ids)
+        for node in self._top_level_and_predicates(where.this):
+            if isinstance(node, exp.EQ):
+                values = self._kb_values_from_equality(node)
+                if values is None:
+                    continue
+                if not values or not set(values).issubset(allowed):
+                    raise UnsafeGaussDBSQL("SQL crosses the allowed kb_id boundary")
+                return True
+            elif isinstance(node, exp.In):
+                values = self._kb_values_from_in(node)
+                if values is None:
+                    continue
+                if not values or not set(values).issubset(allowed):
+                    raise UnsafeGaussDBSQL("SQL crosses the allowed kb_id boundary")
+                return True
+        return False
+
+    def _select_has_static_kb_boundary(self, select) -> bool:
+        from sqlglot import exp
+
+        where = select.args.get("where")
+        if not where:
+            return False
+        for node in self._top_level_and_predicates(where.this):
+            if isinstance(node, exp.EQ):
+                values = self._kb_values_from_equality(node)
+            elif isinstance(node, exp.In):
+                values = self._kb_values_from_in(node)
+            else:
+                values = None
+            if values is None:
+                continue
+            if not values:
+                raise UnsafeGaussDBSQL("kb_id boundary is empty")
+            self._validate_literal_values(values, "kb_id")
+            return True
+        return False
+
+    def _top_level_and_predicates(self, node) -> list:
+        from sqlglot import exp
+
+        if isinstance(node, exp.And):
+            return [*self._top_level_and_predicates(node.this), *self._top_level_and_predicates(node.expression)]
+        return [node]
+
+    def _where_mentions_kb_id(self, select) -> bool:
+        from sqlglot import exp
+
+        where = select.args.get("where")
+        if not where:
+            return False
+        return any(self._is_kb_column(column) for column in where.find_all(exp.Column))
+
+    def _kb_values_from_equality(self, node) -> list[str] | None:
+        from sqlglot import exp
+
+        left, right = node.this, node.expression
+        if self._is_kb_column(left) and isinstance(right, exp.Literal) and right.is_string:
+            return [str(right.this)]
+        if self._is_kb_column(right) and isinstance(left, exp.Literal) and left.is_string:
+            return [str(left.this)]
+        return None
+
+    def _kb_values_from_in(self, node) -> list[str] | None:
+        from sqlglot import exp
+
+        if not self._is_kb_column(node.this):
+            return None
+        values = []
+        for item in node.expressions or []:
+            if not isinstance(item, exp.Literal) or not item.is_string:
+                raise UnsafeGaussDBSQL("kb_id IN must use static string literals")
+            values.append(str(item.this))
+        return values
+
+    def _is_kb_column(self, node) -> bool:
+        from sqlglot import exp
+
+        return isinstance(node, exp.Column) and node.name.lower() == "kb_id"
+
+    def _extract_kb_ids(self, sql: str) -> list[str]:
+        values = []
+        for match in re.finditer(r"\bkb_id\b\s*=\s*'([^']+)'", sql, flags=re.IGNORECASE):
+            values.append(match.group(1))
+        for match in re.finditer(r"\bkb_id\b\s+IN\s*\(([^)]+)\)", sql, flags=re.IGNORECASE):
+            values.extend(re.findall(r"'([^']+)'", match.group(1)))
+        return values
+
+    def _kb_condition(self, kb_ids: tuple[str, ...]) -> str:
+        self._validate_literal_values(kb_ids, "kb_id")
+        if len(kb_ids) == 1:
+            return f"kb_id = '{kb_ids[0]}'"
+        return "kb_id IN (" + ", ".join(f"'{kid}'" for kid in kb_ids) + ")"
+
+    def _validate_literal_values(self, values: tuple[str, ...] | list[str], label: str) -> None:
+        for value in values:
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", str(value)):
+                raise UnsafeGaussDBSQL(f"unsafe {label} literal")
+
+    def _insert_condition(self, sql: str, condition: str) -> str:
+        from sqlglot import exp
+
+        ast = self._parse_one(sql)
+        condition_ast = self._parse_one(f"SELECT 1 WHERE {condition}").args["where"].this
+        where = ast.args.get("where")
+        if where:
+            ast.set("where", exp.Where(this=exp.and_(where.this, condition_ast)))
+        else:
+            ast.set("where", exp.Where(this=condition_ast))
+        return ast.sql(dialect=self.PARSE_DIALECT)
+
+    def _enforce_limit(self, sql: str) -> str:
+        if self.default_limit <= 0:
+            return sql
+        from sqlglot import exp
+
+        ast = self._parse_one(sql)
+        limit = ast.args.get("limit")
+        if not limit:
+            return ast.limit(self.default_limit).sql(dialect=self.PARSE_DIALECT)
+        expression_key = "count" if isinstance(limit, exp.Fetch) else "expression"
+        expression = limit.args.get(expression_key)
+        if isinstance(expression, exp.Literal) and not expression.is_string:
+            try:
+                current = int(expression.this)
+            except (TypeError, ValueError):
+                current = self.default_limit + 1
+            if current <= self.default_limit:
+                return sql
+        limit.set(expression_key, exp.Literal.number(self.default_limit))
+        return ast.sql(dialect=self.PARSE_DIALECT)
+
+    def _select_columns(self, ast) -> list[str]:
+        columns = []
+        for expression in getattr(ast, "expressions", []) or []:
+            alias = getattr(expression, "alias_or_name", None)
+            if alias:
+                columns.append(str(alias))
+        return columns
 
 
 class GaussDBDDLBuilder:
@@ -184,6 +840,500 @@ class GaussDBDDLBuilder:
 
     def vector_valid_column_name(self, dim: int) -> str:
         return f"q_{self.validate_vector_dim(dim)}_vec_valid"
+
+
+class GaussDBSearchBuilder:
+    CHUNK_COLUMNS = {
+        "id",
+        "kb_id",
+        "doc_id",
+        "docnm_kwd",
+        "doc_type_kwd",
+        "title_tks",
+        "title_sm_tks",
+        "content_with_weight",
+        "content_ltks",
+        "content_sm_ltks",
+        "important_kwd",
+        "important_tks",
+        "question_kwd",
+        "question_tks",
+        "tag_kwd",
+        "tag_feas",
+        "available_int",
+        "pagerank_fea",
+        "create_time",
+        "create_timestamp_flt",
+        "img_id",
+        "position_int",
+        "page_num_int",
+        "top_int",
+        "metadata",
+        "chunk_data",
+        "extra",
+        "_order_id",
+        "chunk_order_int",
+        "group_id",
+        "mom_id",
+        "knowledge_graph_kwd",
+        "source_id",
+        "entity_kwd",
+        "entity_type_kwd",
+        "from_entity_kwd",
+        "to_entity_kwd",
+        "weight_int",
+        "weight_flt",
+        "entities_kwd",
+        "rank_flt",
+        "n_hop_with_weight",
+        "removed_kwd",
+        "raptor_kwd",
+        "raptor_layer_int",
+        "row_id()",
+    }
+    JSONB_MULTI_VALUE_COLUMNS = {"important_kwd", "question_kwd", "tag_kwd", "source_id", "entities_kwd"}
+    JSONB_ARRAY_AGG_COLUMNS = JSONB_MULTI_VALUE_COLUMNS | {"entities_kwd"}
+    COLUMN_ALIASES = {"chunk_order_int": "_order_id"}
+    FTS_WEIGHTS = {
+        "title_tks": 10.0,
+        "title_sm_tks": 5.0,
+        "important_tks": 20.0,
+        "question_tks": 20.0,
+        "content_ltks": 2.0,
+        "content_sm_ltks": 1.0,
+    }
+    VECTOR_COLUMN_RE = re.compile(r"^q_(?P<dim>\d+)_vec$")
+    VECTOR_VALID_COLUMN_RE = re.compile(r"^q_(?P<dim>\d+)_vec_valid$")
+
+    def __init__(self, schema: str):
+        self.ddl = GaussDBDDLBuilder(schema=schema)
+
+    def build_search_sql(
+        self,
+        table: str,
+        select_fields: list[str],
+        condition: dict,
+        keywords: list[str] | None,
+        vector: list[float] | None,
+        vector_dim: int | None,
+        vector_weight: float,
+        offset: int,
+        limit: int,
+        similarity_threshold: float | None = None,
+        topn: int | None = None,
+        highlight_fields: list[str] | None = None,
+        order_by: OrderByExpr | None = None,
+        pagerank_weight: float = 0.0,
+    ) -> tuple[str, list[Any]]:
+        query_keywords = [str(keyword).strip() for keyword in keywords or [] if str(keyword).strip()]
+        query_vector = self._vector_param(vector, vector_dim) if vector is not None else None
+        effective_limit = max(int(limit or 0), 0)
+        effective_offset = max(int(offset or 0), 0)
+        page_limit = effective_limit if effective_limit > 0 else max(int(topn or 0), 10000)
+        candidate_limit = self._candidate_limit(page_limit, effective_offset, topn)
+
+        if query_keywords and query_vector is not None:
+            return self._build_hybrid_search_sql(
+                table=table,
+                select_fields=select_fields,
+                condition=condition,
+                keywords=query_keywords,
+                vector=query_vector,
+                vector_dim=vector_dim,
+                vector_weight=vector_weight,
+                similarity_threshold=similarity_threshold,
+                candidate_limit=candidate_limit,
+                offset=effective_offset,
+                limit=page_limit,
+                highlight_fields=highlight_fields,
+                pagerank_weight=pagerank_weight,
+            )
+        if query_vector is not None:
+            return self._build_vector_search_sql(
+                table=table,
+                select_fields=select_fields,
+                condition=condition,
+                vector=query_vector,
+                vector_dim=vector_dim,
+                similarity_threshold=similarity_threshold,
+                candidate_limit=candidate_limit,
+                offset=effective_offset,
+                limit=page_limit,
+                pagerank_weight=pagerank_weight,
+            )
+        if query_keywords:
+            return self._build_fulltext_search_sql(
+                table=table,
+                select_fields=select_fields,
+                condition=condition,
+                keywords=query_keywords,
+                offset=effective_offset,
+                limit=page_limit,
+                highlight_fields=highlight_fields,
+                pagerank_weight=pagerank_weight,
+            )
+        return self._build_filter_search_sql(
+            table=table,
+            select_fields=select_fields,
+            condition=condition,
+            offset=effective_offset,
+            limit=page_limit,
+            order_by=order_by,
+            pagerank_weight=pagerank_weight,
+        )
+
+    def build_condition_where(self, condition: dict | None) -> tuple[str, list[Any]]:
+        fragments: list[str] = []
+        params: list[Any] = []
+        for key, value in (condition or {}).items():
+            if key == "exists":
+                column = self._storage_column(self.validate_column(value))
+                fragments.append(f"{column} IS NOT NULL")
+                continue
+            if key == "must_not" and isinstance(value, dict) and "exists" in value:
+                column = self._storage_column(self.validate_column(value["exists"]))
+                fragments.append(f"{column} IS NULL")
+                continue
+
+            column = self._storage_column(self.validate_column(key))
+            if column in self.JSONB_MULTI_VALUE_COLUMNS:
+                values = self._list_values(value)
+                fragments.append("(" + " OR ".join([f"{column} @> %s::jsonb"] * len(values)) + ")")
+                params.extend(json.dumps([item], ensure_ascii=False) for item in values)
+                continue
+            if isinstance(value, (list, tuple, set)):
+                values = self._list_values(value)
+                fragments.append(f"{column} IN ({', '.join(['%s'] * len(values))})")
+                params.extend(values)
+                continue
+            if value is None:
+                fragments.append(f"{column} IS NULL")
+                continue
+            fragments.append(f"{column} = %s")
+            params.append(value)
+        return " AND ".join(fragments), params
+
+    def build_text_score_expr(self, keywords: list[str]) -> tuple[str, list[Any]]:
+        query_text = self._text_query_param(keywords)
+        weighted_score = " + ".join(
+            f"{weight} * COALESCE(ts_rank(to_tsvector('simple', coalesce({column}, ' ')), plainto_tsquery('simple', %s)), 0)"
+            for column, weight in self.FTS_WEIGHTS.items()
+        )
+        return f"({weighted_score})", [query_text] * len(self.FTS_WEIGHTS)
+
+    def build_vector_score_expr(self, vector_dim: int) -> str:
+        dim = self.ddl.validate_vector_dim(vector_dim)
+        vector_col = self.ddl.vector_column_name(dim)
+        return f"1 - ({vector_col} <+> %s::floatvector({dim}))"
+
+    def build_hybrid_score_expr(self, text_score: str, vector_score: str, vector_weight: float) -> str:
+        _ = float(vector_weight)
+        return f"((1 - %s) * COALESCE({text_score}, 0) + %s * COALESCE({vector_score}, 0))"
+
+    def build_highlight_expr(self, field_name: str, keywords: list[str]) -> tuple[str, list[Any]]:
+        field = self.validate_column(field_name)
+        return (
+            f"ts_headline('simple', COALESCE({field}, ' '), plainto_tsquery('simple', %s)) AS _highlight",
+            [self._text_query_param(keywords)],
+        )
+
+    def build_aggregation_sql(
+        self,
+        table: str,
+        field_name: str,
+        condition: dict | None,
+        limit: int = 1000,
+    ) -> tuple[str, list[Any]]:
+        table_name = self.ddl.qualified_name(table)
+        field = self.validate_column(field_name)
+        where_sql, where_params = self.build_condition_where(condition)
+        where_clause = where_sql or "TRUE"
+        if field in self.JSONB_ARRAY_AGG_COLUMNS:
+            raise ValueError("JSONB array aggregation is not supported by GaussDB A mode")
+        else:
+            sql = (
+                f"SELECT {field} AS value, COUNT(1) AS count "
+                f"FROM {table_name} "
+                f"WHERE {where_clause} AND {field} IS NOT NULL "
+                "GROUP BY value ORDER BY count DESC, value ASC LIMIT %s"
+            )
+        return sql, [*where_params, int(limit)]
+
+    def build_position_order_sql(self) -> str:
+        return (
+            "COALESCE((page_num_int #>> '{0}')::int, 0) ASC, "
+            "COALESCE((position_int #>> '{0,3}')::int, 0) ASC, "
+            "COALESCE((top_int #>> '{0}')::int, 0) ASC"
+        )
+
+    def build_fts_vector_expr(self) -> str:
+        expression = " || ' ' || ".join(f"coalesce({column}, ' ')" for column in self.FTS_WEIGHTS)
+        return f"to_tsvector('simple', {expression})"
+
+    def validate_column(self, column: str) -> str:
+        if column == "row_id()":
+            return column
+        column = str(column or "")
+        if (
+            column in self.CHUNK_COLUMNS
+            or self.VECTOR_COLUMN_RE.fullmatch(column)
+            or self.VECTOR_VALID_COLUMN_RE.fullmatch(column)
+        ):
+            return column
+        raise InvalidGaussDBObjectName(column)
+
+    def normalize_select_fields(self, fields: list[str] | None) -> list[str]:
+        if not fields or "*" in fields:
+            return ["id", "kb_id"]
+        normalized: list[str] = ["id", "kb_id"]
+        for field in fields:
+            if field == "_score":
+                continue
+            column = self.validate_column(field)
+            if column not in normalized:
+                normalized.append(column)
+            match = self.VECTOR_COLUMN_RE.fullmatch(column)
+            if match:
+                valid_column = self.ddl.vector_valid_column_name(int(match.group("dim")))
+                if valid_column not in normalized:
+                    normalized.append(valid_column)
+        return normalized
+
+    def _build_filter_search_sql(
+        self,
+        table: str,
+        select_fields: list[str],
+        condition: dict,
+        offset: int,
+        limit: int,
+        order_by: OrderByExpr | None,
+        pagerank_weight: float,
+    ) -> tuple[str, list[Any]]:
+        table_name = self.ddl.qualified_name(table)
+        columns = self.normalize_select_fields(select_fields)
+        where_sql, where_params = self.build_condition_where(condition)
+        order_sql = self._build_order_by(order_by) or "kb_id ASC, id ASC"
+        score_expr, score_params = self._score_with_pagerank("0.0", pagerank_weight)
+        sql = (
+            f"SELECT {', '.join(self._select_exprs(columns))}, {score_expr} AS _score, COUNT(*) OVER() AS __total "
+            f"FROM {table_name}"
+        )
+        if where_sql:
+            sql += f" WHERE {where_sql}"
+        sql += f" ORDER BY {order_sql} LIMIT %s OFFSET %s"
+        return sql, [*score_params, *where_params, limit, offset]
+
+    def _build_fulltext_search_sql(
+        self,
+        table: str,
+        select_fields: list[str],
+        condition: dict,
+        keywords: list[str],
+        offset: int,
+        limit: int,
+        highlight_fields: list[str] | None,
+        pagerank_weight: float,
+    ) -> tuple[str, list[Any]]:
+        table_name = self.ddl.qualified_name(table)
+        columns = self.normalize_select_fields(select_fields)
+        score_expr, score_params = self.build_text_score_expr(keywords)
+        score_expr, pagerank_params = self._score_with_pagerank(score_expr, pagerank_weight)
+        match_expr, match_params = self._build_text_match_expr(keywords)
+        where_sql, where_params = self.build_condition_where(condition)
+        where_parts = [part for part in (where_sql, match_expr) if part]
+        select_exprs = [*self._select_exprs(columns), f"{score_expr} AS _score", "COUNT(*) OVER() AS __total"]
+        highlight_params: list[Any] = []
+        if highlight_fields:
+            highlight_expr, highlight_params = self.build_highlight_expr(highlight_fields[0], keywords)
+            select_exprs.append(highlight_expr)
+        sql = f"SELECT {', '.join(select_exprs)} FROM {table_name}"
+        if where_parts:
+            sql += f" WHERE {' AND '.join(where_parts)}"
+        sql += " ORDER BY _score DESC, kb_id ASC, id ASC LIMIT %s OFFSET %s"
+        return sql, [*score_params, *pagerank_params, *highlight_params, *where_params, *match_params, limit, offset]
+
+    def _build_vector_search_sql(
+        self,
+        table: str,
+        select_fields: list[str],
+        condition: dict,
+        vector: str,
+        vector_dim: int,
+        similarity_threshold: float | None,
+        candidate_limit: int,
+        offset: int,
+        limit: int,
+        pagerank_weight: float,
+    ) -> tuple[str, list[Any]]:
+        table_name = self.ddl.qualified_name(table)
+        columns = self.normalize_select_fields(select_fields)
+        dim = self.ddl.validate_vector_dim(vector_dim)
+        vector_col = self.ddl.vector_column_name(dim)
+        valid_col = self.ddl.vector_valid_column_name(dim)
+        where_sql, where_params = self.build_condition_where(condition)
+        where_parts = [part for part in (where_sql, f"{valid_col} = TRUE") if part]
+        threshold = 0.0 if similarity_threshold is None else float(similarity_threshold)
+        score_expr, score_params = self._score_with_pagerank(f"1 - ({vector_col} <+> %s::floatvector({dim}))", pagerank_weight)
+        sql = (
+            "WITH vec AS ("
+            f" SELECT {', '.join(self._select_exprs(columns))}, "
+            f"{vector_col} <+> %s::floatvector({dim}) AS distance, "
+            f"{score_expr} AS _score "
+            f"FROM {table_name} "
+            f"WHERE {' AND '.join(where_parts)} "
+            f"ORDER BY {vector_col} <+> %s::floatvector({dim}) ASC "
+            "LIMIT %s"
+            ") "
+            "SELECT vec.*, COUNT(*) OVER() AS __total FROM vec "
+            "WHERE _score >= %s "
+            "ORDER BY distance ASC, kb_id ASC, id ASC LIMIT %s OFFSET %s"
+        )
+        return sql, [vector, vector, *score_params, *where_params, vector, candidate_limit, threshold, limit, offset]
+
+    def _build_hybrid_search_sql(
+        self,
+        table: str,
+        select_fields: list[str],
+        condition: dict,
+        keywords: list[str],
+        vector: str,
+        vector_dim: int,
+        vector_weight: float,
+        similarity_threshold: float | None,
+        candidate_limit: int,
+        offset: int,
+        limit: int,
+        highlight_fields: list[str] | None,
+        pagerank_weight: float,
+    ) -> tuple[str, list[Any]]:
+        table_name = self.ddl.qualified_name(table)
+        columns = self.normalize_select_fields(select_fields)
+        joined_columns = ", ".join(self._select_exprs(columns, prefix="c"))
+        dim = self.ddl.validate_vector_dim(vector_dim)
+        vector_col = self.ddl.vector_column_name(dim)
+        valid_col = self.ddl.vector_valid_column_name(dim)
+        text_score_expr, text_score_params = self.build_text_score_expr(keywords)
+        match_expr, match_params = self._build_text_match_expr(keywords)
+        where_sql, where_params = self.build_condition_where(condition)
+        base_where = where_sql or "TRUE"
+        fts_where = " AND ".join([base_where, match_expr])
+        vector_where = " AND ".join([base_where, f"{valid_col} = TRUE"])
+        threshold = 0.0 if similarity_threshold is None else float(similarity_threshold)
+        select_exprs = [joined_columns, "merged.score AS _score", "COUNT(*) OVER() AS __total"]
+        highlight_params: list[Any] = []
+        if highlight_fields:
+            highlight_expr, highlight_params = self.build_highlight_expr(highlight_fields[0], keywords)
+            select_exprs.append(highlight_expr)
+        final_score_expr, final_score_params = self._score_with_pagerank("merged.score", pagerank_weight, table_alias="c")
+        select_exprs[1] = f"{final_score_expr} AS _score"
+        threshold_expr, threshold_score_params = self._score_with_pagerank("merged.score", pagerank_weight, table_alias="c")
+        sql = (
+            "WITH fts_raw AS ("
+            f" SELECT kb_id, id, {text_score_expr} AS raw_fts_score "
+            f"FROM {table_name} WHERE {fts_where} "
+            "ORDER BY raw_fts_score DESC, kb_id ASC, id ASC LIMIT %s"
+            "), fts AS ("
+            " SELECT kb_id, id, COALESCE(raw_fts_score / NULLIF(MAX(raw_fts_score) OVER (), 0), 0) AS fts_score "
+            "FROM fts_raw"
+            "), vec AS ("
+            f" SELECT kb_id, id, 1 - ({vector_col} <+> %s::floatvector({dim})) AS vector_score "
+            f"FROM {table_name} WHERE {vector_where} "
+            f"ORDER BY {vector_col} <+> %s::floatvector({dim}) ASC LIMIT %s"
+            "), merged AS ("
+            " SELECT COALESCE(fts.kb_id, vec.kb_id) AS kb_id, "
+            "COALESCE(fts.id, vec.id) AS id, "
+            "(1 - %s) * COALESCE(fts.fts_score, 0) + %s * COALESCE(vec.vector_score, 0) AS score "
+            "FROM fts FULL OUTER JOIN vec ON fts.kb_id = vec.kb_id AND fts.id = vec.id"
+            ") "
+            f"SELECT {', '.join(select_exprs)} "
+            f"FROM merged JOIN {table_name} c ON c.kb_id = merged.kb_id AND c.id = merged.id "
+            f"WHERE {threshold_expr} >= %s "
+            "ORDER BY _score DESC, merged.kb_id ASC, merged.id ASC LIMIT %s OFFSET %s"
+        )
+        return sql, [
+            *text_score_params,
+            *where_params,
+            *match_params,
+            candidate_limit,
+            vector,
+            *where_params,
+            vector,
+            candidate_limit,
+            float(vector_weight),
+            float(vector_weight),
+            *final_score_params,
+            *highlight_params,
+            *threshold_score_params,
+            threshold,
+            limit,
+            offset,
+        ]
+
+    def _build_text_match_expr(self, keywords: list[str]) -> tuple[str, list[Any]]:
+        query_text = self._text_query_param(keywords)
+        return f"{self.build_fts_vector_expr()} @@ plainto_tsquery('simple', %s)", [query_text]
+
+    def _build_order_by(self, order_by: OrderByExpr | None) -> str:
+        fields = getattr(order_by, "fields", None) or []
+        parts: list[str] = []
+        for field, direction in fields:
+            column = self.validate_column(field)
+            order = "DESC" if direction else "ASC"
+            if column in {"page_num_int", "position_int", "top_int"}:
+                parts.append(self.build_position_order_sql())
+            else:
+                parts.append(f"{self._storage_column(column)} {order}")
+        return ", ".join(parts)
+
+    def _select_exprs(self, columns: list[str], prefix: str | None = None) -> list[str]:
+        expressions = []
+        for column in columns:
+            if column == "row_id()":
+                expressions.append('NULL AS "row_id()"')
+            elif column in self.COLUMN_ALIASES:
+                storage_column = self._storage_column(column)
+                source = f"{prefix}.{storage_column}" if prefix else storage_column
+                expressions.append(f"{source} AS {column}")
+            elif prefix:
+                expressions.append(f"{prefix}.{column}")
+            else:
+                expressions.append(column)
+        return expressions
+
+    def _storage_column(self, column: str) -> str:
+        return self.COLUMN_ALIASES.get(column, column)
+
+    def _score_with_pagerank(self, score_expr: str, pagerank_weight: float, table_alias: str | None = None) -> tuple[str, list[Any]]:
+        weight = float(pagerank_weight or 0.0)
+        if weight <= 0.0:
+            return score_expr, []
+        column = "pagerank_fea" if table_alias is None else f"{table_alias}.pagerank_fea"
+        pagerank_expr = f"(COALESCE({column}, 0)::DOUBLE PRECISION / 100.0 * %s)"
+        return f"({score_expr} + {pagerank_expr})", [weight]
+
+    def _text_query_param(self, keywords: list[str]) -> str:
+        return " ".join(str(keyword).strip() for keyword in keywords if str(keyword).strip())
+
+    def _vector_param(self, vector: list[float] | tuple[float, ...], vector_dim: int | None) -> str:
+        if vector_dim is None:
+            raise ValueError("vector_dim is required for vector search")
+        dim = self.ddl.validate_vector_dim(vector_dim)
+        values = list(vector)
+        if len(values) != dim:
+            raise ValueError(f"vector dimension mismatch: expected {dim}, got {len(values)}")
+        return "[" + ",".join(str(float(value)) for value in values) + "]"
+
+    def _list_values(self, value) -> list[Any]:
+        values = list(value) if isinstance(value, (list, tuple, set)) else [value]
+        if not values:
+            raise ValueError("empty condition values are not supported")
+        return values
+
+    def _candidate_limit(self, limit: int, offset: int, topn: int | None) -> int:
+        base = max(int(limit or 0) + int(offset or 0), int(limit or 0), 1)
+        if topn and int(topn) > 0:
+            base = max(base, int(topn))
+        return base
 
 
 class GaussDBConnectionBase(DocStoreConnection):

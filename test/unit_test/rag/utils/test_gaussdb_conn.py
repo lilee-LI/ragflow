@@ -1341,9 +1341,19 @@ def test_search_chunk_aggregation_ignores_null_values_and_missing_counts():
     cursor = SequencedCursor([([(None, 2), ("risk", None)], [("value",), ("count",)])])
     conn = make_conn(cursor)
 
-    result = conn.search([], [], {}, [], OrderByExpr(), 0, 10, "ragflow_tenant", ["kb1"], ["tag_kwd"])
+    result = conn.search([], [], {}, [], OrderByExpr(), 0, 10, "ragflow_tenant", ["kb1"], ["docnm_kwd"])
 
     assert result == SearchResult(total=1, chunks=[{"value": "risk", "count": 0}])
+
+
+def test_search_chunk_aggregation_returns_empty_for_jsonb_array_fields():
+    cursor = RecordingCursor()
+    conn = make_conn(cursor)
+
+    result = conn.search([], [], {}, [], OrderByExpr(), 0, 10, "ragflow_tenant", ["kb1"], ["tag_kwd"])
+
+    assert result == SearchResult(total=0, chunks=[])
+    assert cursor.executed == []
 
 
 def test_fetch_metadata_doc_ids_rejects_chunk_table():

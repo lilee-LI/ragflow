@@ -117,6 +117,45 @@ class Dealer:
             group_docs=sres.group_docs,
         )
 
+    def _is_gaussdb_store(self) -> bool:
+        try:
+            return self.dataStore.db_type() == "gaussdb"
+        except Exception:
+            return False
+
+    def _prepare_gaussdb_search_kwargs(self, req):
+        question = str(req.get("question") or "").strip()
+        keywords = [part for part in question.split() if part]
+        vector = req.get("vector")
+        has_vector = bool(vector)
+        if has_vector and keywords:
+            vector_weight = get_float(req.get("vector_similarity_weight", 0.3))
+        elif has_vector:
+            vector_weight = 1.0
+        else:
+            vector_weight = 0.0
+            vector = None
+        vector_weight = max(0.0, min(1.0, vector_weight))
+        page = max(int(req.get("page", 1) or 1), 1)
+        size = int(req.get("size", req.get("topk", 1024)) or 1024)
+        return {
+            "keywords": keywords,
+            "vector": vector if isinstance(vector, (list, tuple)) else None,
+            "offset": (page - 1) * size,
+            "limit": size,
+            "gaussdb_search_params": {
+                "vector_similarity_weight": vector_weight,
+                "term_similarity_weight": 1.0 - vector_weight,
+                "similarity_threshold": get_float(req.get("similarity_threshold", req.get("similarity", 0.0))),
+            },
+        }
+
+    def _docstore_search_kwargs(self, rank_feature: dict | None, gaussdb_search_params: dict | None = None):
+        kwargs = {"rank_feature": rank_feature}
+        if self._is_gaussdb_store() and gaussdb_search_params:
+            kwargs["gaussdb_search_params"] = gaussdb_search_params
+        return kwargs
+
     def get_filters(self, req):
         condition = dict()
         for key, field in {"kb_ids": "kb_id", "doc_ids": "doc_id"}.items():
@@ -155,6 +194,13 @@ class Dealer:
 
         qst = req.get("question", "")
         q_vec = []
+        gaussdb_req = dict(req)
+        if emb_mdl is not None:
+            gaussdb_req["vector"] = True
+        gaussdb_search_params = None
+        if self._is_gaussdb_store():
+            gaussdb_search_params = self._prepare_gaussdb_search_kwargs(gaussdb_req)["gaussdb_search_params"]
+        search_kwargs = self._docstore_search_kwargs(rank_feature, gaussdb_search_params)
         if not qst:
             if req.get("sort"):
                 orderBy.asc("chunk_order_int")
@@ -174,7 +220,7 @@ class Dealer:
             if emb_mdl is None:
                 matchExprs = [matchText]
                 res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, matchExprs, orderBy, offset, limit,
-                                            idx_names, kb_ids, rank_feature=rank_feature)
+                                            idx_names, kb_ids, **search_kwargs)
                 total = self.dataStore.get_total(res)
                 logging.debug("Dealer.search TOTAL: {}".format(total))
             else:
@@ -189,11 +235,15 @@ class Dealer:
                 if settings.DOC_ENGINE_OCEANBASE:
                     src.append(f"q_{len(q_vec)}_vec")
 
-                fusionExpr = FusionExpr("weighted_sum", topk, {"weights": "0.05,0.95"})
+                if self._is_gaussdb_store():
+                    vector_weight = (gaussdb_search_params or {}).get("vector_similarity_weight", req.get("vector_similarity_weight", 0.3))
+                    fusionExpr = FusionExpr("weighted_sum", topk, {"weights": f"{1 - float(vector_weight)},{float(vector_weight)}"})
+                else:
+                    fusionExpr = FusionExpr("weighted_sum", topk, {"weights": "0.05,0.95"})
                 matchExprs = [matchText, matchDense, fusionExpr]
 
                 res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, matchExprs, orderBy, offset, limit,
-                                            idx_names, kb_ids, rank_feature=rank_feature)
+                                            idx_names, kb_ids, **search_kwargs)
                 total = self.dataStore.get_total(res)
                 logging.debug("Dealer.search TOTAL: {}".format(total))
 
@@ -207,7 +257,7 @@ class Dealer:
                         matchDense.extra_options["similarity"] = 0.17
                         res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, [matchText, matchDense, fusionExpr],
                                                     orderBy, offset, limit, idx_names, kb_ids,
-                                                    rank_feature=rank_feature)
+                                                    **search_kwargs)
                         total = self.dataStore.get_total(res)
                     logging.debug("Dealer.search 2 TOTAL: {}".format(total))
 
@@ -610,6 +660,8 @@ class Dealer:
             "topk": top,
             "similarity": similarity_threshold,
             "available_int": 1,
+            "vector_similarity_weight": vector_similarity_weight,
+            "similarity_threshold": similarity_threshold,
         }
         logging.debug(f"[Search] global_offset={global_offset}, rerank_limit={RERANK_LIMIT}, page_size={page_size}, page={page}")
 
@@ -664,6 +716,12 @@ class Dealer:
                     vector_similarity_weight,
                     rank_feature=rank_feature,
                 )
+            elif self._is_gaussdb_store():
+                # GaussDB Path B returns final SQL-side scores from the adapter.
+                sim = [sres.field[id].get("_score", 0.0) for id in sres.ids]
+                sim = [s if s is not None else 0.0 for s in sim]
+                tsim = sim
+                vsim = sim
             else:
                 # ES path: ask ES for the clean cosine score via a second
                 # KNN-only call filtered by the candidate ids, then merge it
