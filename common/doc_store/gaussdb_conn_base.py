@@ -192,6 +192,8 @@ class GaussDBConnectionBase(DocStoreConnection):
         self.pool = pool or GaussDBConnectionPool()
         self.masked_uri = self.pool.masked_uri
         self.resolved_schema = self.pool.resolved_schema
+        self.schema = self.resolved_schema
+        self.ddl = GaussDBDDLBuilder(schema=self.resolved_schema)
         self.pool.check_schema_access()
         self.logger.info("GaussDB %s connection initialized.", self.masked_uri)
 
