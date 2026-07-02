@@ -13,11 +13,177 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+import hashlib
 import logging
+import re
 from timeit import default_timer as timer
 
 from common.doc_store.doc_store_base import DocStoreConnection, MatchExpr, OrderByExpr
 from common.doc_store.gaussdb_conn_pool import GaussDBConnectionError, GaussDBConnectionPool
+
+
+class InvalidGaussDBObjectName(ValueError):
+    pass
+
+
+class GaussDBDDLBuilder:
+    MAX_IDENTIFIER_LENGTH = 63
+    REGULAR_INDEX_COLUMNS = (
+        "doc_id",
+        "available_int",
+        "knowledge_graph_kwd",
+        "entity_type_kwd",
+        "removed_kwd",
+    )
+    FTS_COLUMNS = (
+        "title_tks",
+        "title_sm_tks",
+        "important_tks",
+        "question_tks",
+        "content_ltks",
+        "content_sm_ltks",
+    )
+
+    def __init__(self, schema: str):
+        self.schema = self.validate_identifier(schema)
+
+    def validate_identifier(self, name: str) -> str:
+        if not re.fullmatch(r"(?:[A-Za-z_]|[^\x00-\x7F])(?:[A-Za-z0-9_#$]|[^\x00-\x7F]){0,62}", name or ""):
+            raise InvalidGaussDBObjectName(name)
+        return name
+
+    def quote_identifier(self, name: str) -> str:
+        escaped = self.validate_identifier(name).replace('"', '""')
+        return f'"{escaped}"'
+
+    def qualified_name(self, table: str) -> str:
+        return f"{self.quote_identifier(self.schema)}.{self.quote_identifier(table)}"
+
+    def index_name(self, table: str, suffix: str) -> str:
+        name = f"idx_gdb_{self.validate_identifier(table)}_{self.validate_identifier(suffix)}"
+        if len(name) <= self.MAX_IDENTIFIER_LENGTH:
+            return name
+        digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+        prefix_len = self.MAX_IDENTIFIER_LENGTH - len(digest) - 1
+        return f"{name[:prefix_len]}_{digest}"
+
+    def build_chunk_table_ddl(self, table: str) -> str:
+        name = self.qualified_name(table)
+        return f"""CREATE TABLE IF NOT EXISTS {name} (
+  id VARCHAR(256) NOT NULL,
+  kb_id VARCHAR(256) NOT NULL,
+  doc_id VARCHAR(256),
+  docnm_kwd VARCHAR(256),
+  doc_type_kwd VARCHAR(256),
+  title_tks VARCHAR(256),
+  title_sm_tks VARCHAR(256),
+  content_with_weight TEXT,
+  content_ltks TEXT,
+  content_sm_ltks TEXT,
+  important_kwd JSONB,
+  important_tks TEXT,
+  question_kwd JSONB,
+  question_tks TEXT,
+  tag_kwd JSONB,
+  tag_feas JSONB,
+  available_int INTEGER DEFAULT 1 NOT NULL,
+  pagerank_fea INTEGER,
+  create_time VARCHAR(19),
+  create_timestamp_flt DOUBLE PRECISION,
+  img_id VARCHAR(128),
+  position_int JSONB,
+  page_num_int JSONB,
+  top_int JSONB,
+  metadata JSONB,
+  chunk_data JSONB,
+  extra JSONB,
+  _order_id INTEGER,
+  group_id VARCHAR(256),
+  mom_id VARCHAR(256),
+  knowledge_graph_kwd VARCHAR(256),
+  source_id JSONB,
+  entity_kwd VARCHAR(256),
+  entity_type_kwd VARCHAR(256),
+  from_entity_kwd VARCHAR(256),
+  to_entity_kwd VARCHAR(256),
+  weight_int INTEGER,
+  weight_flt DOUBLE PRECISION,
+  entities_kwd JSONB,
+  rank_flt DOUBLE PRECISION,
+  n_hop_with_weight TEXT,
+  removed_kwd VARCHAR(256) DEFAULT 'N',
+  raptor_kwd VARCHAR(256),
+  raptor_layer_int INTEGER,
+  PRIMARY KEY (kb_id, id)
+) WITH (storage_type=USTORE)"""
+
+    def build_doc_meta_table_ddls(self, meta_table: str) -> list[str]:
+        name = self.qualified_name(meta_table)
+        idx = self.quote_identifier(self.index_name(meta_table, "kb_id"))
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {name} (
+  id VARCHAR(256) NOT NULL,
+  kb_id VARCHAR(256) NOT NULL,
+  meta_fields JSONB,
+  PRIMARY KEY (id)
+) WITH (storage_type=USTORE)""",
+            f"CREATE INDEX IF NOT EXISTS {idx} ON {name} (kb_id)",
+        ]
+
+    def build_regular_index_ddls(self, table: str) -> list[str]:
+        name = self.qualified_name(table)
+        return [
+            f"CREATE INDEX IF NOT EXISTS {self.quote_identifier(self.index_name(table, column))} ON {name} ({column})"
+            for column in self.REGULAR_INDEX_COLUMNS
+        ]
+
+    def build_fulltext_ugin_ddl(self, table: str) -> str:
+        name = self.qualified_name(table)
+        idx = self.quote_identifier(self.index_name(table, "fts_all"))
+        expression = " || ' ' || ".join(f"coalesce({column}, ' ')" for column in self.FTS_COLUMNS)
+        return f"""CREATE INDEX IF NOT EXISTS {idx}
+  ON {name}
+  USING ugin(to_tsvector('simple', {expression}))"""
+
+    def build_vector_column_ddls(self, table: str, dim: int) -> list[str]:
+        dim = self.validate_vector_dim(dim)
+        name = self.qualified_name(table)
+        vector_col = self.vector_column_name(dim)
+        valid_col = self.vector_valid_column_name(dim)
+        return [
+            f"ALTER TABLE {name} ADD COLUMN IF NOT EXISTS {vector_col} floatvector({dim}) DEFAULT (array_fill(0, ARRAY[{dim}])::text::floatvector({dim}))",
+            f"ALTER TABLE {name} ADD COLUMN IF NOT EXISTS {valid_col} BOOLEAN DEFAULT FALSE NOT NULL",
+        ]
+
+    def build_diskann_index_ddl(self, table: str, dim: int) -> str:
+        dim = self.validate_vector_dim(dim)
+        name = self.qualified_name(table)
+        vector_col = self.vector_column_name(dim)
+        idx = self.quote_identifier(self.index_name(table, f"{vector_col}_diskann"))
+        options = "subgraph_count=1"
+        if dim > 1024:
+            options += ", enable_vector_copy=false"
+        return f"CREATE INDEX IF NOT EXISTS {idx} ON {name} USING gsdiskann ({vector_col} COSINE) WITH ({options})"
+
+    def build_advisory_lock_sql(self, lock_name: str) -> tuple[str, list[str]]:
+        return ("SELECT pg_advisory_xact_lock(hashtext(%s))", [str(lock_name)])
+
+    def validate_vector_dim(self, dim: int) -> int:
+        try:
+            value = int(dim)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("vector dimension must be an integer") from exc
+        if value <= 0:
+            raise ValueError("vector dimension must be positive")
+        if value > 4096:
+            raise ValueError("GaussDB floatvector dimensions cannot exceed 4096")
+        return value
+
+    def vector_column_name(self, dim: int) -> str:
+        return f"q_{self.validate_vector_dim(dim)}_vec"
+
+    def vector_valid_column_name(self, dim: int) -> str:
+        return f"q_{self.validate_vector_dim(dim)}_vec_valid"
 
 
 class GaussDBConnectionBase(DocStoreConnection):
