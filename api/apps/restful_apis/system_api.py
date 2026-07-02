@@ -23,7 +23,7 @@ from quart import jsonify
 
 from api.apps import login_required, current_user
 from api.utils.api_utils import get_json_result, get_data_error_result, server_error_response, generate_confirmation_token
-from api.utils.health_utils import run_health_checks, get_oceanbase_status
+from api.utils.health_utils import run_health_checks, get_oceanbase_status, get_gaussdb_status
 from common.versions import get_ragflow_version
 from common.time_utils import current_timestamp, datetime_format
 from api.db.db_models import APIToken
@@ -200,6 +200,42 @@ def oceanbase_status():
             data={
                 "status": "error",
                 "message": f"Failed to get OceanBase status: {str(e)}"
+            },
+            code=500
+        )
+
+
+@manager.route("/system/gaussdb/status", methods=["GET"])  # noqa: F821
+@login_required
+def gaussdb_status():
+    """
+    Get GaussDB health status and performance metrics.
+    ---
+    tags:
+      - System
+    security:
+      - ApiKeyAuth: []
+    responses:
+      200:
+        description: GaussDB status retrieved successfully.
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+              description: Status (alive/timeout/not_configured).
+            message:
+              type: object
+              description: Detailed status information including health and performance metrics.
+    """
+    try:
+        status_info = get_gaussdb_status()
+        return get_json_result(data=status_info)
+    except Exception as e:
+        return get_json_result(
+            data={
+                "status": "error",
+                "message": f"Failed to get GaussDB status: {str(e)}"
             },
             code=500
         )

@@ -16,22 +16,55 @@
 """
 Unit tests for OceanBase health check and performance monitoring functionality.
 """
+import importlib
 import inspect
-import os
+import sys
 import types
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
-from api.utils.health_utils import get_oceanbase_status, check_oceanbase_health
+
+def _install_module(monkeypatch, name, **attrs):
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    monkeypatch.setitem(sys.modules, name, module)
+    return module
+
+
+def _import_health_utils(monkeypatch):
+    import common
+
+    settings_stub = types.SimpleNamespace(
+        docStoreConn=types.SimpleNamespace(health=lambda: {"status": "healthy"}),
+        STORAGE_IMPL=types.SimpleNamespace(health=lambda: True),
+        STORAGE_IMPL_TYPE="MINIO",
+        MINIO={"host": "minio:9000"},
+    )
+    monkeypatch.setitem(sys.modules, "common.settings", settings_stub)
+    monkeypatch.setattr(common, "settings", settings_stub, raising=False)
+
+    _install_module(monkeypatch, "api.db.db_models", DB=types.SimpleNamespace(execute_sql=lambda *_args, **_kwargs: True))
+    _install_module(monkeypatch, "rag.utils.redis_conn", REDIS_CONN=types.SimpleNamespace(health=lambda: True))
+    _install_module(monkeypatch, "rag.utils.es_conn", ESConnection=lambda: types.SimpleNamespace(get_cluster_stats=lambda: {}))
+    _install_module(monkeypatch, "rag.utils.infinity_conn", InfinityConnection=lambda: types.SimpleNamespace(health=lambda: {}))
+    _install_module(monkeypatch, "rag.utils.gaussdb_conn", GaussDBConnection=lambda: types.SimpleNamespace(health=lambda: {}))
+
+    monkeypatch.delitem(sys.modules, "api.utils.health_utils", raising=False)
+    return importlib.import_module("api.utils.health_utils")
+
+
+@pytest.fixture
+def health_utils(monkeypatch):
+    return _import_health_utils(monkeypatch)
 
 
 class TestOceanBaseHealthCheck:
     """Test cases for OceanBase health check functionality."""
-    
-    @patch('api.utils.health_utils.OBConnection')
-    @patch.dict(os.environ, {'DOC_ENGINE': 'oceanbase'})
-    def test_get_oceanbase_status_success(self, mock_ob_class):
+
+    def test_get_oceanbase_status_success(self, monkeypatch, health_utils):
         """Test successful OceanBase status retrieval."""
+        monkeypatch.setenv("DOC_ENGINE", "oceanbase")
         # Setup mock
         mock_ob_connection = Mock()
         mock_ob_connection.uri = "localhost:2881"
@@ -51,10 +84,10 @@ class TestOceanBaseHealthCheck:
             "active_connections": 10,
             "max_connections": 300
         }
-        mock_ob_class.return_value = mock_ob_connection
-        
+        monkeypatch.setattr(health_utils, "OBConnection", Mock(return_value=mock_ob_connection))
+
         # Execute
-        result = get_oceanbase_status()
+        result = health_utils.get_oceanbase_status()
         
         # Assert
         assert result["status"] == "alive"
@@ -63,29 +96,29 @@ class TestOceanBaseHealthCheck:
         assert "performance" in result["message"]
         assert result["message"]["health"]["status"] == "healthy"
         assert result["message"]["performance"]["latency_ms"] == 5.2
-    
-    @patch.dict(os.environ, {'DOC_ENGINE': 'elasticsearch'})
-    def test_get_oceanbase_status_not_configured(self):
+
+    def test_get_oceanbase_status_not_configured(self, monkeypatch, health_utils):
         """Test OceanBase status when not configured."""
+        monkeypatch.setenv("DOC_ENGINE", "elasticsearch")
         with pytest.raises(Exception) as exc_info:
-            get_oceanbase_status()
+            health_utils.get_oceanbase_status()
         assert "OceanBase is not in use" in str(exc_info.value)
-    
-    @patch('api.utils.health_utils.OBConnection')
-    @patch.dict(os.environ, {'DOC_ENGINE': 'oceanbase'})
-    def test_get_oceanbase_status_connection_error(self, mock_ob_class):
+
+    def test_get_oceanbase_status_connection_error(self, monkeypatch, health_utils):
         """Test OceanBase status when connection fails."""
+        monkeypatch.setenv("DOC_ENGINE", "oceanbase")
+        mock_ob_class = Mock()
         mock_ob_class.side_effect = Exception("Connection failed")
-        
-        result = get_oceanbase_status()
-        
+        monkeypatch.setattr(health_utils, "OBConnection", mock_ob_class)
+
+        result = health_utils.get_oceanbase_status()
+
         assert result["status"] == "timeout"
         assert "error" in result["message"]
-    
-    @patch('api.utils.health_utils.OBConnection')
-    @patch.dict(os.environ, {'DOC_ENGINE': 'oceanbase'})
-    def test_check_oceanbase_health_healthy(self, mock_ob_class):
+
+    def test_check_oceanbase_health_healthy(self, monkeypatch, health_utils):
         """Test OceanBase health check returns healthy status."""
+        monkeypatch.setenv("DOC_ENGINE", "oceanbase")
         mock_ob_connection = Mock()
         mock_ob_connection.health.return_value = {
             "uri": "localhost:2881",
@@ -103,19 +136,18 @@ class TestOceanBaseHealthCheck:
             "active_connections": 10,
             "max_connections": 300
         }
-        mock_ob_class.return_value = mock_ob_connection
-        
-        result = check_oceanbase_health()
+        monkeypatch.setattr(health_utils, "OBConnection", Mock(return_value=mock_ob_connection))
+
+        result = health_utils.check_oceanbase_health()
         
         assert result["status"] == "healthy"
         assert result["details"]["connection"] == "connected"
         assert result["details"]["latency_ms"] == 5.2
         assert result["details"]["query_per_second"] == 150
-    
-    @patch('api.utils.health_utils.OBConnection')
-    @patch.dict(os.environ, {'DOC_ENGINE': 'oceanbase'})
-    def test_check_oceanbase_health_degraded(self, mock_ob_class):
+
+    def test_check_oceanbase_health_degraded(self, monkeypatch, health_utils):
         """Test OceanBase health check returns degraded status for high latency."""
+        monkeypatch.setenv("DOC_ENGINE", "oceanbase")
         mock_ob_connection = Mock()
         mock_ob_connection.health.return_value = {
             "uri": "localhost:2881",
@@ -133,17 +165,16 @@ class TestOceanBaseHealthCheck:
             "active_connections": 10,
             "max_connections": 300
         }
-        mock_ob_class.return_value = mock_ob_connection
-        
-        result = check_oceanbase_health()
-        
+        monkeypatch.setattr(health_utils, "OBConnection", Mock(return_value=mock_ob_connection))
+
+        result = health_utils.check_oceanbase_health()
+
         assert result["status"] == "degraded"
         assert result["details"]["latency_ms"] == 1500.0
-    
-    @patch('api.utils.health_utils.OBConnection')
-    @patch.dict(os.environ, {'DOC_ENGINE': 'oceanbase'})
-    def test_check_oceanbase_health_unhealthy(self, mock_ob_class):
+
+    def test_check_oceanbase_health_unhealthy(self, monkeypatch, health_utils):
         """Test OceanBase health check returns unhealthy status."""
+        monkeypatch.setenv("DOC_ENGINE", "oceanbase")
         mock_ob_connection = Mock()
         mock_ob_connection.health.return_value = {
             "uri": "localhost:2881",
@@ -155,18 +186,18 @@ class TestOceanBaseHealthCheck:
             "connection": "disconnected",
             "error": "Connection timeout"
         }
-        mock_ob_class.return_value = mock_ob_connection
-        
-        result = check_oceanbase_health()
+        monkeypatch.setattr(health_utils, "OBConnection", Mock(return_value=mock_ob_connection))
+
+        result = health_utils.check_oceanbase_health()
         
         assert result["status"] == "unhealthy"
         assert result["details"]["connection"] == "disconnected"
         assert "error" in result["details"]
-    
-    @patch.dict(os.environ, {'DOC_ENGINE': 'elasticsearch'})
-    def test_check_oceanbase_health_not_configured(self):
+
+    def test_check_oceanbase_health_not_configured(self, monkeypatch, health_utils):
         """Test OceanBase health check when not configured."""
-        result = check_oceanbase_health()
+        monkeypatch.setenv("DOC_ENGINE", "elasticsearch")
+        result = health_utils.check_oceanbase_health()
         
         assert result["status"] == "not_configured"
         assert result["details"]["connection"] == "not_configured"
