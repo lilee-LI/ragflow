@@ -489,10 +489,12 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_TASK_PAGE_NUMBER, 
         clmns_map = [(py_clmns[i].lower() + fields_map[clmn_tys[i]], str(clmns[i]).replace("_", " ")) for i in range(len(clmns))]
         # field_map: only columns stored in chunk_data (metadata or both) — used for retrieval/SQL
         stored_indices = [i for i in range(len(clmns)) if column_roles.get(clmns[i], "both") in ("metadata", "both")]
-        if settings.DOC_ENGINE_INFINITY or settings.DOC_ENGINE_OCEANBASE or settings.DOC_ENGINE_GAUSSDB:
+        if settings.DOC_ENGINE_INFINITY or settings.DOC_ENGINE_OCEANBASE:
             field_map = {py_clmns[i].lower(): str(clmns[i]).replace("_", " ") for i in stored_indices}
         else:
             field_map = {clmns_map[i][0]: clmns_map[i][1] for i in stored_indices}
+        if settings.DOC_ENGINE_GAUSSDB:
+            field_map = {py_clmns[i].lower(): str(clmns[i]) for i in stored_indices}
         logging.debug(f"Field map (sheet): {field_map}")
         sheet_specs.append(
             {

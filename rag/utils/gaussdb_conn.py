@@ -25,13 +25,21 @@ from psycopg2 import Error as PsycopgError, errorcodes
 from pydantic import BaseModel
 
 from common.constants import PAGERANK_FLD
-from common.doc_store.gaussdb_conn_base import GaussDBConnectionBase, GaussDBSearchBuilder
-from common.doc_store.gaussdb_conn_pool import GaussDBError
+from common.doc_store.doc_store_base import FusionExpr, MatchDenseExpr, MatchTextExpr
+from common.doc_store.gaussdb_conn_base import GaussDBConnectionBase, GaussDBSQLValidator, GaussDBSearchBuilder
 
 logger = logging.getLogger("ragflow.gaussdb_conn")
 
+SQL_QUERY_TIMEOUT_MS = 30000
 VECTOR_COLUMN_RE = re.compile(r"^q_(?P<dim>\d+)_vec$")
 VECTOR_VALID_COLUMN_RE = re.compile(r"^q_(?P<dim>\d+)_vec_valid$")
+
+
+def _tokenize_query_terms(query_text: Any) -> list[str]:
+    from rag.nlp import rag_tokenizer
+
+    return [term for term in rag_tokenizer.tokenize(str(query_text or "")).split() if term]
+
 
 def _application_highlight(text: Any, keywords: list[str]) -> str | None:
     if text is None:
@@ -380,6 +388,39 @@ class GaussDBConnection(GaussDBConnectionBase):
             if value is not None:
                 doc_ids.append(str(value))
         return doc_ids
+
+    def sql(self, sql: str, fetch_size: int = 128, format: str = "json"):
+        self.logger.debug("GaussDBConnection.sql get sql: %s", sql)
+        fetch_size = int(fetch_size or 128)
+        validated = GaussDBSQLValidator.readonly_guard(
+            default_limit=fetch_size,
+            execution_schema=self.schema,
+        ).validate_and_patch(sql)
+        rows, description = self._fetch_all_with_description(
+            validated.sql,
+            [],
+            statement_timeout_ms=SQL_QUERY_TIMEOUT_MS,
+        )
+        columns = [desc[0] for desc in description]
+
+        def coerce_value(value):
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="ignore")
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, ensure_ascii=False)
+            return value
+
+        rows_list = [[coerce_value(value) for value in list(row)] for row in rows or []]
+        result = {
+            "columns": [{"name": column, "type": "text"} for column in columns],
+            "rows": rows_list,
+        }
+        if format == "markdown":
+            header = "|" + "|".join(columns) + "|" if columns else ""
+            separator = "|" + "|".join(["---" for _ in columns]) + "|" if columns else ""
+            body = "\n".join(["|" + "|".join([str(value) for value in row]) + "|" for row in rows_list])
+            result["markdown"] = "\n".join([line for line in [header, separator, body] if line])
+        return result
 
     def get_total(self, res) -> int:
         return int(res.total)
@@ -790,7 +831,7 @@ class GaussDBConnection(GaussDBConnectionBase):
         for expr in match_expressions or []:
             if isinstance(expr, MatchTextExpr):
                 query_text = (expr.extra_options or {}).get("original_query") or expr.matching_text or ""
-                keywords = [part for part in str(query_text).split() if part]
+                keywords = _tokenize_query_terms(query_text)
                 topn = expr.topn if topn is None else min(topn, expr.topn)
             elif isinstance(expr, MatchDenseExpr):
                 if expr.embedding_data_type != "float":
@@ -835,6 +876,8 @@ class GaussDBConnection(GaussDBConnectionBase):
                 effective["kb_id"] = kb_ids
         if "doc_ids" in effective and "doc_id" not in effective:
             effective["doc_id"] = effective.pop("doc_ids")
+        if isinstance(effective.get("doc_id"), (list, tuple, set)) and not effective["doc_id"]:
+            effective.pop("doc_id")
         if not normalize_kb_ids(effective.get("kb_id")):
             raise ValueError("GaussDB chunk search requires a kb_id boundary")
         return effective
@@ -931,7 +974,15 @@ class GaussDBConnection(GaussDBConnectionBase):
                     params.append(value["_title"])
                 continue
             if key in KEY_COLUMNS:
+                if key == "id" and isinstance(value, str) and value == condition.get("id"):
+                    continue
                 raise ValueError(f"key column cannot be updated: {key}")
+            if vector_match := VECTOR_COLUMN_RE.fullmatch(key):
+                dim = int(vector_match.group("dim"))
+                fragments.append(f"{key} = {self._placeholder(key)}")
+                params.append(vector_literal(value, dim))
+                fragments.append(f"{self.ddl.vector_valid_column_name(dim)} = TRUE")
+                continue
             if key not in allowed_columns:
                 raise ValueError(f"unknown column for update: {key}")
             if key in jsonb_columns:
@@ -952,33 +1003,37 @@ class GaussDBConnection(GaussDBConnectionBase):
 
         fragments = []
         params = []
-        allowed_columns = DOC_META_COLUMN_SET if is_meta else CHUNK_COLUMN_SET
-        allowed_columns = allowed_columns | {"exists", "must_not"}
+
+        def column_expression(column: str) -> str:
+            if not is_meta and column in GaussDBSearchBuilder.JSONB_EXTRA_SCALAR_COLUMNS:
+                return self._search_builder()._storage_column(column)
+            validate_filter_column(column, is_meta)
+            return column
+
         for key, value in effective.items():
             if key == "exists":
-                validate_filter_column(value, is_meta)
-                fragments.append(f"{value} IS NOT NULL")
+                column = column_expression(value)
+                fragments.append(f"{column} IS NOT NULL")
                 continue
             if key == "must_not" and isinstance(value, dict) and "exists" in value:
-                validate_filter_column(value["exists"], is_meta)
-                fragments.append(f"{value['exists']} IS NULL")
+                column = column_expression(value["exists"])
+                fragments.append(f"{column} IS NULL")
                 continue
-            if key not in allowed_columns:
-                validate_filter_column(key, is_meta)
+            column = column_expression(key)
             if key in JSONB_MULTI_VALUE_COLUMNS:
                 values = list(value) if isinstance(value, (list, tuple, set)) else [value]
                 if not values:
                     raise ValueError(f"empty list condition for {key}")
-                fragments.append("(" + " OR ".join([f"{key} @> %s::jsonb"] * len(values)) + ")")
+                fragments.append("(" + " OR ".join([f"{column} @> %s::jsonb"] * len(values)) + ")")
                 params.extend(json.dumps([item], ensure_ascii=False) for item in values)
             elif isinstance(value, (list, tuple, set)):
                 values = list(value)
                 if not values:
                     raise ValueError(f"empty list condition for {key}")
-                fragments.append(f"{key} IN ({', '.join(['%s'] * len(values))})")
+                fragments.append(f"{column} IN ({', '.join(['%s'] * len(values))})")
                 params.extend(values)
             else:
-                fragments.append(f"{key} = %s")
+                fragments.append(f"{column} = %s")
                 params.append(value)
         return " AND ".join(fragments), params
 

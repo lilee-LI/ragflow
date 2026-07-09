@@ -69,6 +69,44 @@ class UnsafeGaussDBSQL(ValueError):
     pass
 
 
+def _parse_gaussdb_statements(sql: str, dialect: str = "postgres"):
+    from sqlglot import exp, parse
+
+    try:
+        return exp, parse(sql, read=dialect)
+    except Exception:
+        raise UnsafeGaussDBSQL("SQL parse failed") from None
+
+
+def is_gaussdb_aggregate_sql(sql: str) -> bool:
+    exp, expressions = _parse_gaussdb_statements(sql)
+    if len(expressions) != 1:
+        raise UnsafeGaussDBSQL("exactly one SQL statement is allowed")
+    return any(isinstance(node, exp.AggFunc) for node in expressions[0].walk())
+
+
+_FIELD_DESCRIPTOR_TYPES = {
+    "bool",
+    "boolean",
+    "date",
+    "datetime",
+    "double",
+    "float",
+    "integer",
+    "json",
+    "number",
+    "string",
+    "text",
+}
+
+
+def gaussdb_field_json_path_parts(field: str, descriptor: Any = None) -> tuple[str, ...]:
+    candidate = str(descriptor or "").strip()
+    if candidate and candidate.lower() not in _FIELD_DESCRIPTOR_TYPES:
+        return tuple(part for part in candidate.split(".") if part)
+    return tuple(part for part in str(field).split(".") if part)
+
+
 @dataclass(frozen=True)
 class ExposedGaussDBTable:
     logical_name: str
@@ -80,8 +118,8 @@ class ExposedGaussDBTable:
     @classmethod
     def from_field_map(cls, physical_name: str, kb_ids: list[str] | tuple[str, ...], field_map: dict[str, Any]):
         json_fields = {}
-        for field in field_map or {}:
-            parts = tuple(part for part in str(field).split(".") if part)
+        for field, descriptor in (field_map or {}).items():
+            parts = gaussdb_field_json_path_parts(str(field), descriptor)
             if parts:
                 json_fields[str(field)] = parts
         return cls(
@@ -101,11 +139,13 @@ class ValidatedGaussDBSQL:
 
 
 def jsonb_path_literal(parts: list[str] | tuple[str, ...]) -> str:
-    if not parts:
+    if not isinstance(parts, (list, tuple)) or not parts:
         raise UnsafeGaussDBSQL("empty JSONB path")
     encoded = []
     for part in parts:
-        segment = str(part)
+        if not isinstance(part, str):
+            raise UnsafeGaussDBSQL("invalid JSONB path segment")
+        segment = part
         if not segment:
             raise UnsafeGaussDBSQL("empty JSONB path segment")
         if re.fullmatch(r"[A-Za-z0-9_]+", segment):
@@ -113,13 +153,14 @@ def jsonb_path_literal(parts: list[str] | tuple[str, ...]) -> str:
         else:
             escaped = segment.replace("\\", "\\\\").replace('"', '\\"')
             encoded.append(f'"{escaped}"')
-    return "'{" + ",".join(encoded) + "}'"
+    path = "{" + ",".join(encoded) + "}"
+    return "'" + path.replace("'", "''") + "'"
 
 
 def _parse_jsonb_path_literal(value: str) -> tuple[str, ...]:
     text = str(value or "").strip()
     if len(text) >= 2 and text[0] == "'" and text[-1] == "'":
-        text = text[1:-1]
+        text = text[1:-1].replace("''", "'")
     if not (text.startswith("{") and text.endswith("}")):
         raise UnsafeGaussDBSQL("dynamic JSONB path is not allowed")
     body = text[1:-1]
@@ -143,7 +184,7 @@ def _parse_jsonb_path_literal(value: str) -> tuple[str, ...]:
             buf = []
             continue
         buf.append(char)
-    if quoted:
+    if quoted or escaped:
         raise UnsafeGaussDBSQL("invalid JSONB path literal")
     parts.append("".join(buf))
     if not parts or any(part == "" for part in parts):
@@ -153,10 +194,6 @@ def _parse_jsonb_path_literal(value: str) -> tuple[str, ...]:
 
 class GaussDBSQLValidator:
     PARSE_DIALECT = "postgres"
-    FORBIDDEN_RE = re.compile(
-        r"\b(delete|update|insert|drop|alter|create|truncate|merge|copy|grant|revoke|call|execute|do|vacuum|analyze|set)\b",
-        re.IGNORECASE,
-    )
     FORBIDDEN_FUNCTIONS = {
         "pg_sleep",
         "sleep",
@@ -178,15 +215,11 @@ class GaussDBSQLValidator:
         "json_extract_isnull",
         "jsonb_each",
         "jsonb_each_text",
+        "jsonb_to_record",
+        "jsonb_to_recordset",
         "jsonb_array_elements",
         "jsonb_array_elements_text",
     }
-    ALLOWED_FUNCTIONS = {"to_date"}
-    AGGREGATE_RE = re.compile(r"\b(count|sum|avg|max|min)\s*\(", re.IGNORECASE)
-    SYSTEM_FUNCTION_RE = re.compile(
-        r"\b(now|current_user|current_date|current_time|current_timestamp|current_database|current_catalog|localtime|localtimestamp|session_user|user|version|current_schema)\s*(?:\(|\b)",
-        re.IGNORECASE,
-    )
 
     def __init__(
         self,
@@ -195,6 +228,7 @@ class GaussDBSQLValidator:
         default_limit: int = 128,
         readonly_only: bool = False,
         runtime_readonly_guard: bool = False,
+        execution_schema: str | None = None,
     ):
         if tables is None:
             self.tables = {}
@@ -208,10 +242,16 @@ class GaussDBSQLValidator:
         self.default_limit = int(default_limit or 128)
         self.readonly_only = readonly_only
         self.runtime_readonly_guard = runtime_readonly_guard
+        self.execution_schema = str(execution_schema).strip() if execution_schema else None
 
     @classmethod
-    def readonly_guard(cls, default_limit: int = 128):
-        return cls(default_limit=default_limit, readonly_only=True, runtime_readonly_guard=True)
+    def readonly_guard(cls, default_limit: int = 128, execution_schema: str | None = None):
+        return cls(
+            default_limit=default_limit,
+            readonly_only=True,
+            runtime_readonly_guard=True,
+            execution_schema=execution_schema,
+        )
 
     def validate_and_patch(self, raw_sql: str) -> ValidatedGaussDBSQL:
         sql = self.normalize_sql(raw_sql)
@@ -237,10 +277,13 @@ class GaussDBSQLValidator:
             self._validate_tables(ast)
             self._validate_jsonb_paths(ast)
             self._validate_columns(ast)
+        if self.execution_schema:
+            self._qualify_execution_tables(ast)
+            sql = ast.sql(dialect=self.PARSE_DIALECT)
         return ValidatedGaussDBSQL(
             sql=sql,
             columns=self._select_columns(ast),
-            is_aggregation=bool(self.AGGREGATE_RE.search(sql)),
+            is_aggregation=is_gaussdb_aggregate_sql(sql),
         )
 
     def normalize_sql(self, raw_sql: str) -> str:
@@ -256,15 +299,7 @@ class GaussDBSQLValidator:
         return sql
 
     def _parse_one(self, sql: str):
-        try:
-            from sqlglot import exp, parse
-            from sqlglot.errors import ParseError
-        except Exception as exc:
-            raise UnsafeGaussDBSQL("sqlglot is required for GaussDB SQL validation") from exc
-        try:
-            expressions = parse(sql, read=self.PARSE_DIALECT)
-        except ParseError as exc:
-            raise UnsafeGaussDBSQL("SQL parse failed") from exc
+        exp, expressions = _parse_gaussdb_statements(sql, self.PARSE_DIALECT)
         if len(expressions) != 1:
             raise UnsafeGaussDBSQL("exactly one SQL statement is allowed")
         if not isinstance(expressions[0], exp.Select):
@@ -284,6 +319,10 @@ class GaussDBSQLValidator:
         )
         if any(isinstance(node, forbidden_types) for node in ast.walk()):
             raise UnsafeGaussDBSQL("SQL contains a non-read-only expression")
+        if any(isinstance(node, exp.Lateral) for node in ast.walk()):
+            raise UnsafeGaussDBSQL("LATERAL is not allowed")
+        self._validate_limit_clauses(ast)
+        self._validate_jsonb_empty_string_comparisons(ast)
         forbidden_system_types = tuple(
             cls
             for cls in (
@@ -322,11 +361,64 @@ class GaussDBSQLValidator:
         for node in ast.find_all(exp.Func):
             if isinstance(node, (exp.Binary, exp.Connector, exp.Predicate)) and not isinstance(node, allowed_func_types):
                 continue
-            name = str(getattr(node, "name", "") or node.__class__.__name__).lower()
+            name = str(getattr(node, "name", "") or "").lower()
+            if not name:
+                sql_name = str(node.sql_name() if hasattr(node, "sql_name") else "").lower()
+                name = sql_name.removeprefix("exploding_") or node.__class__.__name__.lower()
             if isinstance(node, forbidden_system_types) or name in self.FORBIDDEN_FUNCTIONS:
                 raise UnsafeGaussDBSQL(f"function {name} is not allowed")
             if not isinstance(node, allowed_func_types):
                 raise UnsafeGaussDBSQL(f"function {name} is not allowed")
+
+    def _validate_limit_clauses(self, ast) -> None:
+        from sqlglot import exp
+
+        for node in ast.walk():
+            if isinstance(node, exp.Fetch):
+                expression = node.args.get("count")
+            elif isinstance(node, exp.Limit):
+                expression = node.args.get("expression")
+            else:
+                continue
+            self._positive_static_limit_value(expression)
+
+    @staticmethod
+    def _positive_static_limit_value(expression) -> int:
+        from sqlglot import exp
+
+        if (
+            not isinstance(expression, exp.Literal)
+            or expression.is_string
+            or not re.fullmatch(r"[0-9]+", str(expression.this))
+            or int(expression.this) <= 0
+        ):
+            raise UnsafeGaussDBSQL("LIMIT must be a positive static integer")
+        return int(expression.this)
+
+    def _validate_jsonb_empty_string_comparisons(self, ast) -> None:
+        from sqlglot import exp
+
+        jsonb_text_types = (exp.JSONBExtractScalar,)
+
+        def is_empty_string(expression) -> bool:
+            while isinstance(expression, (exp.Cast, exp.Paren)):
+                expression = expression.this
+            return isinstance(expression, exp.Literal) and expression.is_string and expression.this == ""
+
+        def contains_jsonb_text(expression) -> bool:
+            return any(isinstance(node, jsonb_text_types) for node in expression.walk())
+
+        comparison_types = tuple(
+            cls for cls in (exp.EQ, exp.NEQ, getattr(exp, "NullSafeEQ", None), getattr(exp, "NullSafeNEQ", None)) if cls
+        )
+        for comparison in ast.walk():
+            if not isinstance(comparison, comparison_types):
+                continue
+            left, right = comparison.this, comparison.expression
+            if (is_empty_string(left) and contains_jsonb_text(right)) or (
+                is_empty_string(right) and contains_jsonb_text(left)
+            ):
+                raise UnsafeGaussDBSQL("JSONB text cannot be compared with an empty SQL string")
 
     def _validate_runtime_readonly_context(self, ast) -> None:
         from sqlglot import exp
@@ -378,6 +470,16 @@ class GaussDBSQLValidator:
             if name and name not in cte_names:
                 tables.append(name)
         return tables
+
+    def _qualify_execution_tables(self, ast) -> None:
+        from sqlglot import exp
+
+        cte_names = self._cte_names(ast)
+        schema = exp.to_identifier(self.execution_schema, quoted=True)
+        for table in ast.find_all(exp.Table):
+            if table.db or table.catalog or table.name in cte_names:
+                continue
+            table.set("db", schema.copy())
 
     def _validate_tables(self, ast) -> None:
         allowed = {table.physical_name for table in self.tables.values()} | set(self.tables)
@@ -463,18 +565,12 @@ class GaussDBSQLValidator:
         from sqlglot import exp
 
         allowed_paths = {path for table in self.tables.values() for path in table.json_fields.values()}
-        json_classes = tuple(
-            cls for cls in (getattr(exp, "JSONExtractScalar", None), getattr(exp, "JSONExtract", None)) if cls
-        )
-        jsonb_classes = tuple(
-            cls for cls in (getattr(exp, "JSONBExtractScalar", None), getattr(exp, "JSONBExtract", None)) if cls
-        )
+        json_classes = (exp.JSONExtractScalar, exp.JSONExtract)
+        jsonb_classes = (exp.JSONBExtractScalar, exp.JSONBExtract)
         allowed_chunk_data_columns = set()
         for node in ast.walk():
-            if json_classes and isinstance(node, json_classes):
+            if isinstance(node, json_classes):
                 raise UnsafeGaussDBSQL("only GaussDB #> / #>> JSONB operators are allowed")
-            if not jsonb_classes:
-                continue
             if not isinstance(node, jsonb_classes):
                 continue
             source = node.this
@@ -515,7 +611,13 @@ class GaussDBSQLValidator:
             missing.append(select)
         if not missing:
             return sql
-        if len(missing) == 1 and missing[0] is ast and not ast.args.get("with_") and len(set(self._direct_base_tables(ast))) == 1:
+        if (
+            len(missing) == 1
+            and missing[0] is ast
+            and len(self._selects_with_base_tables(ast)) == 1
+            and not ast.args.get("with_")
+            and len(set(self._direct_base_tables(ast))) == 1
+        ):
             if self._where_mentions_kb_id(ast):
                 raise UnsafeGaussDBSQL("kb_id boundary must be a positive top-level predicate")
             return self._insert_condition(sql, self._kb_condition(kb_ids))
@@ -657,14 +759,6 @@ class GaussDBSQLValidator:
 
         return isinstance(node, exp.Column) and node.name.lower() == "kb_id"
 
-    def _extract_kb_ids(self, sql: str) -> list[str]:
-        values = []
-        for match in re.finditer(r"\bkb_id\b\s*=\s*'([^']+)'", sql, flags=re.IGNORECASE):
-            values.append(match.group(1))
-        for match in re.finditer(r"\bkb_id\b\s+IN\s*\(([^)]+)\)", sql, flags=re.IGNORECASE):
-            values.extend(re.findall(r"'([^']+)'", match.group(1)))
-        return values
-
     def _kb_condition(self, kb_ids: tuple[str, ...]) -> str:
         self._validate_literal_values(kb_ids, "kb_id")
         if len(kb_ids) == 1:
@@ -689,23 +783,18 @@ class GaussDBSQLValidator:
         return ast.sql(dialect=self.PARSE_DIALECT)
 
     def _enforce_limit(self, sql: str) -> str:
-        if self.default_limit <= 0:
-            return sql
         from sqlglot import exp
 
         ast = self._parse_one(sql)
         limit = ast.args.get("limit")
         if not limit:
+            if self.default_limit <= 0:
+                return sql
             return ast.limit(self.default_limit).sql(dialect=self.PARSE_DIALECT)
         expression_key = "count" if isinstance(limit, exp.Fetch) else "expression"
-        expression = limit.args.get(expression_key)
-        if isinstance(expression, exp.Literal) and not expression.is_string:
-            try:
-                current = int(expression.this)
-            except (TypeError, ValueError):
-                current = self.default_limit + 1
-            if current <= self.default_limit:
-                return sql
+        current = self._positive_static_limit_value(limit.args.get(expression_key))
+        if self.default_limit <= 0 or current <= self.default_limit:
+            return sql
         limit.set(expression_key, exp.Literal.number(self.default_limit))
         return ast.sql(dialect=self.PARSE_DIALECT)
 
@@ -932,10 +1021,12 @@ class GaussDBSearchBuilder:
         "removed_kwd",
         "raptor_kwd",
         "raptor_layer_int",
+        "compile_kwd",
         "row_id()",
     }
     JSONB_MULTI_VALUE_COLUMNS = {"important_kwd", "question_kwd", "tag_kwd", "source_id", "entities_kwd"}
     JSONB_ARRAY_AGG_COLUMNS = JSONB_MULTI_VALUE_COLUMNS | {"entities_kwd"}
+    JSONB_EXTRA_SCALAR_COLUMNS = {"compile_kwd"}
     COLUMN_ALIASES = {"chunk_order_int": "_order_id"}
     FTS_WEIGHTS = {
         "title_tks": 10.0,
@@ -1074,22 +1165,14 @@ class GaussDBSearchBuilder:
             return score_exprs[0], params
         return f"(({' + '.join(score_exprs)}) / {len(score_exprs)}.0)", params
 
-    def build_vector_score_expr(self, vector_dim: int) -> str:
-        dim = self.ddl.validate_vector_dim(vector_dim)
-        vector_col = self.ddl.vector_column_name(dim)
-        return f"1 - ({vector_col} <+> %s::floatvector({dim}))"
-
-    def build_hybrid_score_expr(self, text_score: str, vector_score: str, vector_weight: float) -> str:
-        _ = float(vector_weight)
-        return f"((1 - %s) * COALESCE({text_score}, 0) + %s * COALESCE({vector_score}, 0))"
-
     def build_highlight_expr(self, field_name: str, keywords: list[str]) -> tuple[str, list[Any]]:
         field = self.validate_column(field_name)
         _simple_terms, ngram_terms = self.split_text_query_terms(keywords)
         if ngram_terms:
             return f"COALESCE({field}, ' ') AS _highlight_source", []
         return (
-            f"ts_headline('simple', COALESCE({field}, ' '), plainto_tsquery('simple', %s)) AS _highlight",
+            f"ts_headline('simple', COALESCE({field}, ' '), plainto_tsquery('simple', %s), "
+            "'StartSel=<em>, StopSel=</em>') AS _highlight",
             [self._text_query_param(keywords)],
         )
 
@@ -1350,6 +1433,9 @@ class GaussDBSearchBuilder:
         for column in columns:
             if column == "row_id()":
                 expressions.append('NULL AS "row_id()"')
+            elif column in self.JSONB_EXTRA_SCALAR_COLUMNS:
+                source = f"{prefix}.extra" if prefix else "extra"
+                expressions.append(f"({source} #>> '{{{column}}}') AS {column}")
             elif column in self.COLUMN_ALIASES:
                 storage_column = self._storage_column(column)
                 source = f"{prefix}.{storage_column}" if prefix else storage_column
@@ -1361,6 +1447,8 @@ class GaussDBSearchBuilder:
         return expressions
 
     def _storage_column(self, column: str) -> str:
+        if column in self.JSONB_EXTRA_SCALAR_COLUMNS:
+            return f"(extra #>> '{{{column}}}')"
         return self.COLUMN_ALIASES.get(column, column)
 
     def _score_with_pagerank(self, score_expr: str, pagerank_weight: float, table_alias: str | None = None) -> tuple[str, list[Any]]:
