@@ -18,17 +18,35 @@ from __future__ import annotations
 import json
 import logging
 import re
+from math import isfinite
 from typing import Any, Iterable
 
 from psycopg2 import Error as PsycopgError, errorcodes
 from pydantic import BaseModel
 
-from common.doc_store.gaussdb_conn_base import GaussDBConnectionBase
+from common.constants import PAGERANK_FLD
+from common.doc_store.gaussdb_conn_base import GaussDBConnectionBase, GaussDBSearchBuilder
+from common.doc_store.gaussdb_conn_pool import GaussDBError
 
 logger = logging.getLogger("ragflow.gaussdb_conn")
 
 VECTOR_COLUMN_RE = re.compile(r"^q_(?P<dim>\d+)_vec$")
 VECTOR_VALID_COLUMN_RE = re.compile(r"^q_(?P<dim>\d+)_vec_valid$")
+
+def _application_highlight(text: Any, keywords: list[str]) -> str | None:
+    if text is None:
+        return None
+    simple_terms, ngram_terms = GaussDBSearchBuilder.split_text_query_terms(keywords)
+    unique_terms: dict[str, str] = {}
+    for term in [*simple_terms, *ngram_terms]:
+        unique_terms.setdefault(term.casefold(), term)
+    terms = sorted(unique_terms.values(), key=len, reverse=True)
+    if not terms:
+        return None
+    pattern = re.compile("|".join(re.escape(term) for term in terms), re.IGNORECASE)
+    highlighted, count = pattern.subn(lambda match: f"<em>{match.group(0)}</em>", str(text))
+    return highlighted if count else None
+
 
 class GaussDBError(Exception):
     pass
@@ -130,6 +148,7 @@ class GaussDBConnection(GaussDBConnectionBase):
         statements.append(self.ddl.build_fulltext_ugin_ddl(index_name))
         statements.append(self.ddl.build_ngram_fulltext_ugin_ddl(index_name))
         statements.extend(self.ddl.build_vector_column_ddls(index_name, vector_size))
+        statements.append("SET LOCAL maintenance_work_mem = '1GB'")
         statements.append(self.ddl.build_diskann_index_ddl(index_name, vector_size))
         self._execute_statements(statements)
         return True
@@ -203,6 +222,12 @@ class GaussDBConnection(GaussDBConnectionBase):
             placeholders = ", ".join(["%s"] * len(kb_ids))
             where += f" AND kb_id IN ({placeholders})"
             params.extend(kb_ids)
+        if not is_meta and len(kb_ids) > 1:
+            sql = f"SELECT * FROM {table} WHERE {where} ORDER BY kb_id ASC LIMIT 2"
+            rows, description = self._fetch_all_with_description(sql, params)
+            chunks = [self._row_to_chunk(row, description) for row in rows or []]
+            self._check_cross_kb_duplicate_chunk_ids(chunks)
+            return chunks[0] if chunks else None
         sql = f"SELECT * FROM {table} WHERE {where} LIMIT 1"
         row, description = self._fetch_one_with_description(sql, params)
         if row is None:
@@ -227,6 +252,8 @@ class GaussDBConnection(GaussDBConnectionBase):
         if knowledgebase_ids is None:
             knowledgebase_ids = kwargs.get("dataset_ids") or []
         tables = normalize_table_names(index_names)
+        if not tables:
+            return SearchResult(total=0, chunks=[])
         if len(tables) == 1 and is_doc_meta_table(tables[0]) and not match_expressions and not agg_fields:
             return self._search_doc_meta_table(
                 select_fields=select_fields,
@@ -237,7 +264,54 @@ class GaussDBConnection(GaussDBConnectionBase):
                 index_name=tables[0],
                 knowledgebase_ids=knowledgebase_ids,
             )
-        raise NotImplementedError("GaussDB chunk search is implemented in the search task")
+        if any(is_doc_meta_table(table) for table in tables):
+            raise ValueError("document metadata tables cannot be mixed with chunk search")
+
+        if agg_fields:
+            return self._search_chunk_aggregation(
+                tables=tables,
+                condition=condition,
+                knowledgebase_ids=knowledgebase_ids,
+                agg_fields=agg_fields,
+            )
+
+        parsed = self._parse_match_expressions(match_expressions, rank_feature)
+        scoped_condition = self._scoped_search_condition(condition, knowledgebase_ids)
+        if len(tables) == 1:
+            return self._search_chunk_table(
+                table=tables[0],
+                select_fields=select_fields,
+                highlight_fields=highlight_fields,
+                condition=scoped_condition,
+                parsed=parsed,
+                order_by=order_by,
+                offset=offset,
+                limit=limit,
+            )
+
+        effective_offset = max(int(offset or 0), 0)
+        effective_limit = max(int(limit or 0), 0)
+        if effective_limit == 0:
+            effective_limit = 10000
+        collection_limit = effective_offset + effective_limit
+        total = 0
+        chunks: list[dict] = []
+        for table in tables:
+            result = self._search_chunk_table(
+                table=table,
+                select_fields=select_fields,
+                highlight_fields=highlight_fields,
+                condition=scoped_condition,
+                parsed=parsed,
+                order_by=order_by,
+                offset=0,
+                limit=collection_limit,
+            )
+            total += result.total
+            chunks.extend(result.chunks)
+        chunks = self._sort_search_chunks(chunks, order_by, has_match=bool(parsed["keywords"] or parsed["vector"]))
+        chunks = chunks[effective_offset : effective_offset + effective_limit]
+        return SearchResult(total=total, chunks=chunks)
 
     def update(self, condition: dict, new_value: dict, index_name: str, knowledgebase_id: str) -> bool:
         if not condition or not new_value:
@@ -313,7 +387,23 @@ class GaussDBConnection(GaussDBConnectionBase):
     def get_doc_ids(self, res) -> list[str]:
         return [row["id"] for row in res.chunks if "id" in row]
 
+    @staticmethod
+    def _check_cross_kb_duplicate_chunk_ids(rows) -> None:
+        seen_kb_ids = {}
+        for row in rows or []:
+            chunk_id = row.get("id")
+            if chunk_id is None:
+                continue
+            kb_id = row.get("kb_id")
+            if kb_id is None:
+                continue
+            previous_kb_id = seen_kb_ids.get(chunk_id)
+            if previous_kb_id is not None and previous_kb_id != kb_id:
+                raise GaussDBError(f"cross-KB duplicate chunk id: {chunk_id}")
+            seen_kb_ids[chunk_id] = kb_id
+
     def get_fields(self, res, fields: list[str]) -> dict[str, dict]:
+        self._check_cross_kb_duplicate_chunk_ids(res.chunks)
         result = {}
         for row in res.chunks:
             chunk_id = row.get("id")
@@ -323,10 +413,14 @@ class GaussDBConnection(GaussDBConnectionBase):
         return result
 
     def get_highlight(self, res, keywords: list[str], field_name: str):
+        self._check_cross_kb_duplicate_chunk_ids(res.chunks)
         highlights = {}
         for row in res.chunks:
             chunk_id = row.get("id")
-            value = row.get("_highlight") or row.get("highlight")
+            if row.get("_highlight_source") is not None:
+                value = _application_highlight(row["_highlight_source"], keywords)
+            else:
+                value = row.get("_highlight") or row.get("highlight")
             if chunk_id and value:
                 highlights[chunk_id] = value
         return highlights
@@ -346,6 +440,14 @@ class GaussDBConnection(GaussDBConnectionBase):
             elif isinstance(value, str) and value.strip():
                 counts[value] = counts.get(value, 0) + 1
         return result or list(counts.items())
+
+    def get_scores(self, res) -> dict[str, float]:
+        self._check_cross_kb_duplicate_chunk_ids(res.chunks)
+        return {
+            row["id"]: float(row.get("_score") or 0.0)
+            for row in res.chunks
+            if row.get("id") is not None
+        }
 
     def get_vector_dimensions(self, index_name: str) -> list[int]:
         self.ddl.validate_identifier(index_name)
@@ -516,12 +618,19 @@ class GaussDBConnection(GaussDBConnectionBase):
         index_name: str,
         knowledgebase_ids: list[str],
     ) -> SearchResult:
-        table = self.ddl.qualified_name(index_name)
-        columns = select_doc_meta_columns(select_fields)
         effective_condition = dict(condition or {})
         kb_ids = normalize_kb_ids(knowledgebase_ids)
-        if kb_ids and "kb_id" not in effective_condition:
-            effective_condition["kb_id"] = kb_ids
+        condition_kb_ids = normalize_kb_ids(effective_condition.get("kb_id"))
+        if kb_ids:
+            if condition_kb_ids and not set(condition_kb_ids).issubset(set(kb_ids)):
+                raise ValueError("condition kb_id must stay within knowledgebase_ids")
+            if not condition_kb_ids:
+                effective_condition["kb_id"] = kb_ids
+        if not normalize_kb_ids(effective_condition.get("kb_id")):
+            raise ValueError("GaussDB document metadata search requires a kb_id boundary")
+
+        table = self.ddl.qualified_name(index_name)
+        columns = select_doc_meta_columns(select_fields)
         where_sql, where_params = self._build_where_clause(effective_condition, None, is_meta=True)
         sql = f"SELECT {', '.join(columns)}, COUNT(*) OVER() AS __total FROM {table}"
         if where_sql:
@@ -546,6 +655,196 @@ class GaussDBConnection(GaussDBConnectionBase):
             row = self._fetch_one(count_sql, where_params)
             total = int(row[0]) if row else 0
         return SearchResult(total=total, chunks=chunks)
+
+    def _search_chunk_aggregation(
+        self,
+        tables: list[str],
+        condition: dict,
+        knowledgebase_ids: list[str] | None,
+        agg_fields: list[str],
+    ) -> SearchResult:
+        if len(agg_fields) != 1:
+            raise ValueError("GaussDB search supports one aggregation field per request")
+        counts: dict[Any, int] = {}
+        scoped_condition = self._scoped_search_condition(condition, knowledgebase_ids)
+        for table in tables:
+            try:
+                sql, params = self._search_builder().build_aggregation_sql(
+                    table=table,
+                    field_name=agg_fields[0],
+                    condition=scoped_condition,
+                )
+            except ValueError as exc:
+                if "JSONB array aggregation" in str(exc):
+                    return SearchResult(total=0, chunks=[])
+                raise
+            rows, description = self._fetch_all_with_description(sql, params)
+            for row in rows or []:
+                chunk = self._row_to_chunk(row, description)
+                if chunk.get("count") is not None:
+                    chunk["count"] = int(chunk["count"])
+                value = chunk.get("value")
+                if value is not None:
+                    counts[value] = counts.get(value, 0) + int(chunk.get("count") or 0)
+        chunks = [
+            {"value": value, "count": count}
+            for value, count in sorted(counts.items(), key=lambda item: (-item[1], str(item[0])))
+        ][:1000]
+        return SearchResult(total=len(chunks), chunks=chunks)
+
+    def _search_chunk_table(
+        self,
+        table: str,
+        select_fields: list[str],
+        highlight_fields: list[str],
+        condition: dict,
+        parsed: dict[str, Any],
+        order_by,
+        offset: int,
+        limit: int,
+    ) -> SearchResult:
+        sql, params = self._search_builder().build_search_sql(
+            table=table,
+            select_fields=select_fields,
+            condition=condition,
+            keywords=parsed["keywords"],
+            vector=parsed["vector"],
+            vector_dim=parsed["vector_dim"],
+            vector_weight=parsed["vector_weight"],
+            similarity_threshold=parsed["similarity_threshold"],
+            topn=parsed["topn"],
+            offset=offset,
+            limit=limit,
+            highlight_fields=highlight_fields,
+            order_by=order_by,
+            pagerank_weight=parsed["pagerank_weight"],
+        )
+        rows, description = self._fetch_all_with_description(sql, params)
+        result = self._rows_to_search_result(rows, description)
+        if result.chunks or not max(int(offset or 0), 0):
+            return result
+
+        count_sql, count_params = self._search_builder().build_search_sql(
+            table=table,
+            select_fields=["id"],
+            condition=condition,
+            keywords=parsed["keywords"],
+            vector=parsed["vector"],
+            vector_dim=parsed["vector_dim"],
+            vector_weight=parsed["vector_weight"],
+            similarity_threshold=parsed["similarity_threshold"],
+            topn=parsed["topn"],
+            offset=0,
+            limit=1,
+            highlight_fields=[],
+            order_by=order_by,
+            pagerank_weight=parsed["pagerank_weight"],
+        )
+        count_rows, count_description = self._fetch_all_with_description(count_sql, count_params)
+        count_result = self._rows_to_search_result(count_rows, count_description)
+        return SearchResult(total=count_result.total, chunks=[])
+
+    def _rows_to_search_result(self, rows, description) -> SearchResult:
+        total = 0
+        chunks = []
+        for row in rows or []:
+            chunk = self._row_to_chunk(row, description)
+            total = int(chunk.pop("__total", total or 0) or 0)
+            chunks.append(chunk)
+        return SearchResult(total=total, chunks=chunks)
+
+    def _sort_search_chunks(self, chunks: list[dict], order_by, has_match: bool) -> list[dict]:
+        fields = getattr(order_by, "fields", None) or []
+        if not fields:
+            if has_match:
+                return sorted(
+                    chunks,
+                    key=lambda row: (
+                        -(float(row.get("_score") or 0.0)),
+                        str(row.get("kb_id") or ""),
+                        str(row.get("id") or ""),
+                    ),
+                )
+            return sorted(chunks, key=lambda row: (str(row.get("kb_id") or ""), str(row.get("id") or "")))
+        sorted_chunks = list(chunks)
+        for field, direction in reversed(fields):
+            sorted_chunks.sort(
+                key=lambda row, field=field: sortable_search_value(row.get(field), field),
+                reverse=bool(direction),
+            )
+        return sorted_chunks
+
+    def _parse_match_expressions(
+        self,
+        match_expressions: list,
+        rank_feature: dict | None,
+    ) -> dict[str, Any]:
+        keywords: list[str] = []
+        vector = None
+        vector_dim = None
+        topn = None
+        vector_weight = None
+        similarity_threshold = None
+        pagerank_weight = 0.0
+
+        for expr in match_expressions or []:
+            if isinstance(expr, MatchTextExpr):
+                query_text = (expr.extra_options or {}).get("original_query") or expr.matching_text or ""
+                keywords = [part for part in str(query_text).split() if part]
+                topn = expr.topn if topn is None else min(topn, expr.topn)
+            elif isinstance(expr, MatchDenseExpr):
+                if expr.embedding_data_type != "float":
+                    raise ValueError(f"unsupported GaussDB vector data type: {expr.embedding_data_type}")
+                vector = list(expr.embedding_data)
+                vector_dim = parse_vector_dim(expr.vector_column_name) or len(vector)
+                topn = expr.topn if topn is None else min(topn, expr.topn)
+                similarity_threshold = float((expr.extra_options or {}).get("similarity", 0.0))
+            elif isinstance(expr, FusionExpr):
+                vector_weight = parse_fusion_vector_weight(expr)
+                topn = expr.topn if topn is None else min(topn, expr.topn)
+
+        if rank_feature and rank_feature.get(PAGERANK_FLD) is not None:
+            pagerank_weight = float(rank_feature[PAGERANK_FLD])
+
+        if vector is None:
+            vector_weight = 0.0
+        elif not keywords:
+            vector_weight = 1.0 if vector_weight is None else float(vector_weight)
+        else:
+            vector_weight = 0.5 if vector_weight is None else float(vector_weight)
+
+        return {
+            "keywords": keywords,
+            "vector": vector,
+            "vector_dim": vector_dim,
+            "vector_weight": vector_weight,
+            "similarity_threshold": similarity_threshold,
+            "topn": topn,
+            "pagerank_weight": pagerank_weight,
+        }
+
+    def _scoped_search_condition(self, condition: dict | None, knowledgebase_ids: list[str] | None) -> dict:
+        effective = dict(condition or {})
+        kb_ids = normalize_kb_ids(knowledgebase_ids)
+        if kb_ids:
+            condition_kb_ids = normalize_kb_ids(effective.get("kb_id"))
+            if condition_kb_ids:
+                if not set(condition_kb_ids).issubset(set(kb_ids)):
+                    raise ValueError("condition kb_id must stay within knowledgebase_ids")
+            else:
+                effective["kb_id"] = kb_ids
+        if "doc_ids" in effective and "doc_id" not in effective:
+            effective["doc_id"] = effective.pop("doc_ids")
+        if not normalize_kb_ids(effective.get("kb_id")):
+            raise ValueError("GaussDB chunk search requires a kb_id boundary")
+        return effective
+
+    def _search_builder(self) -> GaussDBSearchBuilder:
+        builder = getattr(self, "search_builder", None)
+        if builder is None:
+            builder = GaussDBSearchBuilder(schema=self.schema)
+            self.search_builder = builder
+        return builder
 
     def _build_set_clause(self, new_value: dict, is_meta: bool, condition: dict) -> tuple[str, list[Any]]:
         fragments = []
@@ -768,11 +1067,13 @@ class GaussDBConnection(GaussDBConnectionBase):
             close_cursor(cur)
             self.pool.put_conn(conn)
 
-    def _fetch_all_with_description(self, sql: str, params: list[Any]):
+    def _fetch_all_with_description(self, sql: str, params: list[Any], statement_timeout_ms: int | None = None):
         conn = self.pool.get_conn()
         cur = None
         try:
             cur = conn.cursor()
+            if statement_timeout_ms and statement_timeout_ms > 0:
+                cur.execute(f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}")
             cur.execute(sql, params)
             return cur.fetchall(), getattr(cur, "description", None) or []
         finally:
@@ -816,6 +1117,47 @@ def normalize_table_names(index_names: str | list[str]) -> list[str]:
     if isinstance(index_names, str):
         return [name.strip() for name in index_names.split(",") if name.strip()]
     return [str(name).strip() for name in index_names or [] if str(name).strip()]
+
+
+def parse_vector_dim(vector_column_name: str) -> int | None:
+    match = VECTOR_COLUMN_RE.fullmatch(str(vector_column_name or ""))
+    return int(match.group("dim")) if match else None
+
+
+def parse_fusion_vector_weight(expr: FusionExpr) -> float | None:
+    params = expr.fusion_params or {}
+    weights = params.get("weights")
+    if not weights:
+        return None
+    try:
+        return float(str(weights).split(",")[-1])
+    except (TypeError, ValueError):
+        return None
+
+
+def sortable_search_value(value: Any, field: str):
+    if field == "page_num_int":
+        return nested_numeric_value(value, [0])
+    if field == "position_int":
+        return nested_numeric_value(value, [0, 3])
+    if field == "top_int":
+        return nested_numeric_value(value, [0])
+    if isinstance(value, (int, float)):
+        return value
+    if value is None:
+        return ""
+    return str(value)
+
+
+def nested_numeric_value(value: Any, path: list[int]) -> float:
+    current = value
+    try:
+        for index in path:
+            current = current[index]
+        numeric = float(current)
+        return numeric if isfinite(numeric) else 100000000.0
+    except (TypeError, ValueError, IndexError, KeyError, OverflowError):
+        return 100000000.0
 
 
 def select_doc_meta_columns(select_fields: list[str]) -> list[str]:
