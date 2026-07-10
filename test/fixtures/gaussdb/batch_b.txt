@@ -1,0 +1,2 @@
+batch beta {{RUN_ID}}
+Only the beta document contains BETA_ONLY_{{RUN_ID}}.

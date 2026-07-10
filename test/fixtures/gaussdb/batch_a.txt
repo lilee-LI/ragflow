@@ -1,0 +1,2 @@
+batch alpha {{RUN_ID}}
+Only the alpha document contains ALPHA_ONLY_{{RUN_ID}}.
