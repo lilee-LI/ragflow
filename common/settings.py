@@ -46,6 +46,7 @@ from rag.nlp import search
 import memory.utils.es_conn as memory_es_conn
 import memory.utils.infinity_conn as memory_infinity_conn
 import memory.utils.ob_conn as memory_ob_conn
+import memory.utils.gaussdb_conn as memory_gaussdb_conn
 
 TIMEZONE = os.getenv("TZ", "Asia/Shanghai")
 
@@ -422,6 +423,11 @@ def init_settings():
         msgStoreConn = memory_infinity_conn.InfinityConnection()
     elif lower_case_doc_engine in ["oceanbase", "seekdb"]:
         msgStoreConn = memory_ob_conn.OBConnection()
+    elif lower_case_doc_engine == "gaussdb":
+        # Memory Store 必须通过独立 adapter 访问 message 表。它和
+        # docStoreConn 读取同一份 gaussdb.config，并通过公共懒加载连接池共享
+        # 物理连接，但不能复用文档 chunk adapter 的表结构或查询语义。
+        msgStoreConn = memory_gaussdb_conn.GaussDBMemoryConnection()
 
     global AZURE, S3, MINIO, OSS, GCS
     if STORAGE_IMPL_TYPE in ["AZURE_SPN", "AZURE_SAS"]:
