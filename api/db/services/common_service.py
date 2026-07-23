@@ -23,12 +23,26 @@ import peewee
 from peewee import InterfaceError, OperationalError
 
 from api.db.db_models import DB
+from api.db.gaussdb_error_utils import is_retryable_transaction_error
+from common import settings
 from common.misc_utils import get_uuid
 from common.time_utils import current_timestamp, datetime_format
 
 
 def _is_deadlock_error(exc: OperationalError) -> bool:
-    return isinstance(exc, OperationalError) and bool(getattr(exc, "args", ())) and exc.args[0] == 1213
+    if not isinstance(exc, OperationalError):
+        return False
+
+    args = getattr(exc, "args", ())
+    if args and args[0] == 1213:
+        return True
+
+    # 适配点：函数名保留为 _is_deadlock_error，是为了不扩大调用方改动；
+    # 实际判断范围已经扩展为“事务并发冲突可重试错误”。真实 GaussDB 实测：
+    # 40P01=deadlock detected，40001=serialization failure，
+    # 55P03=NOWAIT/行锁不可用。Peewee 外层异常没有 pgcode，SQLSTATE 需要从
+    # __context__ 的 psycopg2 原始异常提取。
+    return settings.DATABASE_TYPE.lower() == "gaussdb" and is_retryable_transaction_error(exc)
 
 
 def retry_deadlock_operation(max_retries=3, retry_delay=0.1):
@@ -274,6 +288,16 @@ class CommonService:
         #     Number of records updated
         data["update_time"] = current_timestamp()
         data["update_date"] = datetime_format(datetime.now())
+        # Only the GaussDB adapter exposes this hook. Centralized GaussDB and
+        # every other database retain the original update_by_id behavior.
+        replace_update = getattr(DB, "replace_update_by_id", None)
+        if replace_update is not None:
+            num = replace_update(cls.model, pid, data)
+            if num is not None:
+                return num
+        prepare_update = getattr(DB, "prepare_update_by_id", None)
+        if prepare_update is not None:
+            data = prepare_update(cls.model, pid, data)
         num = cls.model.update(data).where(cls.model.id == pid).execute()
         return num
 

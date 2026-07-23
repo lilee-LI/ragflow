@@ -300,12 +300,37 @@ def check_oceanbase_health() -> dict:
 
 
 def get_mysql_status():
+    if settings.DATABASE_TYPE.lower() == "gaussdb":
+        # GaussDB cannot execute MySQL's SHOW PROCESSLIST.
+        return get_database_status()
+
     try:
         cursor = DB.execute_sql("SHOW PROCESSLIST;")
         res_rows = cursor.fetchall()
         headers = ["id", "user", "host", "db", "command", "time", "state", "info"]
         cursor.close()
         return {"status": "alive", "message": [dict(zip(headers, r)) for r in res_rows]}
+    except Exception as e:
+        return {
+            "status": "timeout",
+            "message": f"error: {str(e)}",
+        }
+
+
+def get_database_status():
+    try:
+        # 适配点：SELECT 1 是 MySQL/PostgreSQL/GaussDB 都支持的最小探针。
+        # Admin 展示 GaussDB metadata DB 时使用它，避免误用 MySQL-only SQL。
+        cursor = DB.execute_sql("SELECT 1;")
+        row = cursor.fetchone()
+        cursor.close()
+        return {
+            "status": "alive",
+            "message": {
+                "database": settings.DATABASE_TYPE.lower(),
+                "result": row[0] if row else None,
+            },
+        }
     except Exception as e:
         return {
             "status": "timeout",

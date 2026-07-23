@@ -17,6 +17,7 @@ import os
 import json
 import secrets
 import logging
+import re
 from datetime import date
 
 from common.constants import RAG_FLOW_SERVICE_NAME
@@ -71,8 +72,89 @@ SECRET_KEY = None
 FACTORY_LLM_INFOS = None
 ALLOWED_LLM_FACTORIES = None
 
-DATABASE_TYPE = os.getenv("DB_TYPE", "mysql")
-DATABASE = decrypt_database_config(name=DATABASE_TYPE)
+# GaussDB 适配点：metadata DB 和 DocEngine/Memory Store 虽然都可能连接
+# GaussDB，但它们的库、schema、兼容模式和账号权限可以完全不同。因此业务
+# 元数据库只读取 GAUSSDB_METADATA_* 命名空间；service_conf.yaml 里的
+# gaussdb.config 继续专属于 DOC_ENGINE=gaussdb，不能混用。
+GAUSSDB_ENV_DEFAULTS = {
+    "name": "rag_flow",
+    "user": "rag_flow",
+    "password": "infini_rag_flow",
+    "host": "gaussdb",
+    "port": 8000,
+    "schema": "public",
+    "max_connections": 100,
+    "stale_timeout": 30,
+    "options": "-c client_encoding=UTF8 -c default_transaction_read_only=off",
+}
+_GAUSSDB_SCHEMA_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def normalize_database_type(database_type: str | None = None) -> str:
+    # Only normalize the new GaussDB values. Existing database names retain
+    # their upstream spelling and lookup behavior.
+    raw_value = database_type or "mysql"
+    normalized = raw_value.strip().lower()
+    if normalized in {"gaussdb", "gauss"}:
+        return "gaussdb"
+    return raw_value
+
+
+def _get_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_gaussdb_metadata_schema(value: str | None = None) -> str:
+    # schema 会被拼入 libpq options 的 search_path。这里限制为普通 SQL
+    # 标识符，避免把引号、分号或空白参数注入到连接 options 中。metadata DB
+    # 当前不支持跨 schema 形式，调用方需要提供单个 schema 名。
+    schema = (value or GAUSSDB_ENV_DEFAULTS["schema"]).strip() or GAUSSDB_ENV_DEFAULTS["schema"]
+    if not _GAUSSDB_SCHEMA_PATTERN.match(schema):
+        raise ValueError(f"invalid GAUSSDB_METADATA_SCHEMA: {schema}")
+    return schema
+
+
+def _gaussdb_metadata_options(schema: str) -> str:
+    explicit_options = os.environ.get("GAUSSDB_METADATA_OPTIONS")
+    if explicit_options is not None:
+        # 显式 options 是整段覆盖，不做增量拼接。这样高级部署可以自己控制
+        # search_path、编码、只读开关等 libpq 参数；代价是调用方必须把默认
+        # 需要的选项也一并写入。
+        return explicit_options
+    return f"-c search_path={schema} {GAUSSDB_ENV_DEFAULTS['options']}"
+
+
+def _gaussdb_env_config() -> dict:
+    # 适配点：metadata DB 只读取 GAUSSDB_METADATA_*，避免和
+    # DOC_ENGINE=gaussdb 的 DocEngine/Memory Store 配置争用同一组连接参数。
+    schema = _normalize_gaussdb_metadata_schema(os.environ.get("GAUSSDB_METADATA_SCHEMA"))
+    return {
+        "name": os.environ.get("GAUSSDB_METADATA_DBNAME", GAUSSDB_ENV_DEFAULTS["name"]),
+        "user": os.environ.get("GAUSSDB_METADATA_USER", GAUSSDB_ENV_DEFAULTS["user"]),
+        "password": os.environ.get("GAUSSDB_METADATA_PASSWORD", GAUSSDB_ENV_DEFAULTS["password"]),
+        "host": os.environ.get("GAUSSDB_METADATA_HOST", GAUSSDB_ENV_DEFAULTS["host"]),
+        "port": _get_int_env("GAUSSDB_METADATA_PORT", GAUSSDB_ENV_DEFAULTS["port"]),
+        "max_connections": _get_int_env("GAUSSDB_METADATA_MAX_CONNECTIONS", GAUSSDB_ENV_DEFAULTS["max_connections"]),
+        "stale_timeout": _get_int_env("GAUSSDB_METADATA_STALE_TIMEOUT", GAUSSDB_ENV_DEFAULTS["stale_timeout"]),
+        "options": _gaussdb_metadata_options(schema),
+    }
+
+
+def load_database_config(database_type: str) -> dict:
+    database_type = normalize_database_type(database_type)
+    if database_type == "gaussdb":
+        # 适配点：DB_TYPE=gaussdb 时无条件从 GAUSSDB_METADATA_* 组装连接。
+        # 这是为了隔离 metadata DB 与 DOC_ENGINE=gaussdb 的 gaussdb.config；
+        # 即使配置文件里存在 gaussdb 块，也不应被业务元数据库读取。
+        return decrypt_database_config(database=_gaussdb_env_config())
+    return decrypt_database_config(name=database_type)
+
+
+DATABASE_TYPE = normalize_database_type(os.getenv("DB_TYPE", "mysql"))
+DATABASE = load_database_config(DATABASE_TYPE)
 
 # authentication
 AUTHENTICATION_CONF = None
@@ -220,8 +302,8 @@ class StorageFactory:
 
 def init_settings():
     global DATABASE_TYPE, DATABASE
-    DATABASE_TYPE = os.getenv("DB_TYPE", "mysql")
-    DATABASE = decrypt_database_config(name=DATABASE_TYPE)
+    DATABASE_TYPE = normalize_database_type(os.getenv("DB_TYPE", "mysql"))
+    DATABASE = load_database_config(DATABASE_TYPE)
 
     global ALLOWED_LLM_FACTORIES, LLM_FACTORY, LLM_BASE_URL
     llm_settings = get_base_config("user_default_llm", {}) or {}

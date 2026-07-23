@@ -16,6 +16,8 @@
 
 
 import logging
+import os
+import re
 import threading
 from enum import Enum
 
@@ -36,6 +38,7 @@ class BaseConfig(BaseModel):
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "name": self.name, "host": self.host, "port": self.port, "service_type": self.service_type}
 
+
 class ServiceConfigs:
     configs = list[BaseConfig]
 
@@ -45,6 +48,61 @@ class ServiceConfigs:
 
 
 SERVICE_CONFIGS = ServiceConfigs
+# Admin 服务列表展示读取的是同一套 service_conf/local.service_conf，但
+# GaussDB metadata DB 连接不从配置文件读取，避免和 DocEngine/Memory Store
+# 的 gaussdb.config 混用。这里保留一份轻量配置解析，是为了让 Admin 页面
+# 展示的 metadata DB 与主服务 DATABASE 配置一致，而不是误展示未启用的
+# mysql/postgres 配置块。
+GAUSSDB_ENV_DEFAULTS = {
+    "name": "rag_flow",
+    "user": "rag_flow",
+    "password": "infini_rag_flow",
+    "host": "gaussdb",
+    "port": 8000,
+    "schema": "public",
+}
+_GAUSSDB_SCHEMA_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def normalize_database_type(database_type: str | None = None) -> str:
+    # Only normalize the new GaussDB values. Existing metadata database
+    # selection retains the upstream behavior.
+    raw_value = database_type or "mysql"
+    normalized = raw_value.strip().lower()
+    if normalized in {"gaussdb", "gauss"}:
+        return "gaussdb"
+    return raw_value
+
+
+def _get_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_gaussdb_metadata_schema(value: str | None = None) -> str:
+    # Admin 只展示 schema，不负责创建连接；但展示层也要使用同一套校验规则，
+    # 否则非法 GAUSSDB_METADATA_SCHEMA 可能在 Admin 页面看起来合法，主服务
+    # 实际启动时却失败。
+    schema = (value or GAUSSDB_ENV_DEFAULTS["schema"]).strip() or GAUSSDB_ENV_DEFAULTS["schema"]
+    if not _GAUSSDB_SCHEMA_PATTERN.match(schema):
+        raise ValueError(f"invalid GAUSSDB_METADATA_SCHEMA: {schema}")
+    return schema
+
+
+def _gaussdb_env_config() -> dict[str, Any]:
+    # 适配点：只用于 Admin 服务配置展示和健康检查，不参与业务 ORM 连接创建。
+    # 字段保持 metadata DB 平铺结构，和 common.settings._gaussdb_env_config()
+    # 对齐，避免两边展示/连接的信息不一致。
+    return {
+        "name": os.environ.get("GAUSSDB_METADATA_DBNAME", GAUSSDB_ENV_DEFAULTS["name"]),
+        "user": os.environ.get("GAUSSDB_METADATA_USER", GAUSSDB_ENV_DEFAULTS["user"]),
+        "password": os.environ.get("GAUSSDB_METADATA_PASSWORD", GAUSSDB_ENV_DEFAULTS["password"]),
+        "host": os.environ.get("GAUSSDB_METADATA_HOST", GAUSSDB_ENV_DEFAULTS["host"]),
+        "port": _get_int_env("GAUSSDB_METADATA_PORT", GAUSSDB_ENV_DEFAULTS["port"]),
+        "schema": _normalize_gaussdb_metadata_schema(os.environ.get("GAUSSDB_METADATA_SCHEMA")),
+    }
 
 
 class ServiceType(Enum):
@@ -81,6 +139,16 @@ class MySQLConfig(MetaConfig):
         extra_dict["username"] = self.username
         extra_dict["password"] = self.password
         result["extra"] = extra_dict
+        return result
+
+
+class GaussDBMetadataConfig(MySQLConfig):
+    metadata_schema: str
+
+    def to_dict(self) -> dict[str, Any]:
+        result = super().to_dict()
+        result["extra"]["schema"] = self.metadata_schema
+        result["extra"]["password"] = "*" * 8
         return result
 
 
@@ -233,6 +301,7 @@ def load_configurations(config_path: str) -> list[BaseConfig]:
     configurations = []
     ragflow_count = 0
     id_count = 0
+    metadata_db_type = normalize_database_type(os.getenv("DB_TYPE", "mysql"))
     for k, v in raw_configs.items():
         match k:
             case "ragflow":
@@ -308,18 +377,31 @@ def load_configurations(config_path: str) -> list[BaseConfig]:
                 configurations.append(config)
                 id_count += 1
             case "mysql":
+                if metadata_db_type == "gaussdb":
+                    continue
                 name: str = "mysql"
                 host: str = v.get("host")
                 port: int = v.get("port")
                 username = v.get("user")
                 password = v.get("password")
                 config = MySQLConfig(
-                    id=id_count, name=name, host=host, port=port, username=username, password=password, service_type="meta_data", meta_type="mysql", detail_func_name="get_mysql_status"
+                    id=id_count,
+                    name=name,
+                    host=host,
+                    port=port,
+                    username=username,
+                    password=password,
+                    service_type="meta_data",
+                    meta_type="mysql",
+                    detail_func_name="get_mysql_status",
                 )
                 configurations.append(config)
                 id_count += 1
             case "gaussdb":
-                # 配置文件中的 gaussdb 块属于 DocEngine/Memory Store。
+                # 配置文件中的 gaussdb 块属于 DocEngine/Memory Store，不是
+                # DB_TYPE=gaussdb 的业务元数据库连接。metadata GaussDB 会在
+                # 循环后从 GAUSSDB_METADATA_* 单独补入，避免 Admin 把两套
+                # GaussDB 配置合并成一个服务。
                 doc_config = v.get("config", {})
                 host = doc_config.get("host")
                 port = doc_config.get("port")
@@ -368,5 +450,23 @@ def load_configurations(config_path: str) -> list[BaseConfig]:
             case _:
                 logging.warning(f"Unknown configuration key: {k}")
                 continue
+
+    if metadata_db_type == "gaussdb":
+        # 适配点：Admin 跟随主服务的 GAUSSDB_METADATA_* 环境变量展示
+        # metadata DB，避免读取 DocEngine/Memory Store 的 GAUSSDB_*。
+        v = _gaussdb_env_config()
+        config = GaussDBMetadataConfig(
+            id=id_count,
+            name="gaussdb",
+            host=v.get("host"),
+            port=v.get("port"),
+            username=v.get("user"),
+            password=v.get("password"),
+            metadata_schema=v.get("schema"),
+            service_type="meta_data",
+            meta_type="gaussdb",
+            detail_func_name="get_database_status",
+        )
+        configurations.append(config)
 
     return configurations

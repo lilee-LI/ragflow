@@ -20,7 +20,46 @@ from playhouse.pool import PooledMySQLDatabase
 
 from common.time_utils import current_timestamp, timestamp_to_date
 
-from api.db.db_models import DB, DataBaseModel
+from api.db.db_models import DB, DataBaseModel, is_gaussdb_compatible_database
+
+
+def _gaussdb_replace_insert_by_id(model, batch, preserve):
+    """GaussDB O-compatible 下替代 Peewee ``ON CONFLICT`` 的批量 upsert。
+
+    适配原因：Peewee 在 PostgreSQL 方言下会把
+    ``insert_many(...).on_conflict(conflict_target="id")`` 生成
+    ``INSERT ... ON CONFLICT (...) DO UPDATE ... RETURNING``。真实 GaussDB
+    O 兼容库在该语法处报错，导致 `/datasets/{id}/documents/parse` 这类会批量
+    写入 task 的真实 API 失败。
+
+    适配方式：只在 DB_TYPE=gaussdb 下把这一类按 id 冲突替换的写入拆成两步：
+
+    * 先查本批次中已经存在的 id，对已存在行执行 UPDATE，更新列仍使用 Peewee
+      PostgreSQL 分支原本会 preserve 的字段集合；
+    * 对不存在的 id 执行普通 INSERT，避免生成 GaussDB O 兼容库不接受的
+      ``ON CONFLICT`` SQL。
+
+    影响边界：MySQL 继续使用自身的 on duplicate key 语义，PostgreSQL/OceanBase
+    继续走原有 Peewee 生成逻辑；这里不改变其它数据库的 SQL。
+    """
+    ids = [data.get("id") for data in batch if data.get("id") is not None]
+    existing_ids = set()
+    if ids:
+        existing_ids = {row[0] for row in model.select(model.id).where(model.id.in_(ids)).tuples()}
+
+    insert_rows = []
+    update_columns = [column for column in preserve if column != "id"]
+    for data in batch:
+        row_id = data.get("id")
+        if row_id in existing_ids:
+            update_payload = {column: data[column] for column in update_columns if column in data}
+            if update_payload:
+                model.update(update_payload).where(model.id == row_id).execute()
+        else:
+            insert_rows.append(data)
+
+    if insert_rows:
+        model.insert_many(insert_rows).execute()
 
 
 @DB.connection_context()
@@ -46,6 +85,13 @@ def bulk_insert_into_db(model, data_source, replace_on_conflict=False):
             if replace_on_conflict:
                 if isinstance(DB, PooledMySQLDatabase):
                     query = query.on_conflict(preserve=preserve)
+                elif is_gaussdb_compatible_database():
+                    # GaussDB O-compatible 适配点：Peewee 的 PostgreSQL 分支会生成
+                    # `ON CONFLICT (...) DO UPDATE ... RETURNING`，当前真实 O 兼容库
+                    # 在该语法处报错。这里改用“先查 id，再 UPDATE/INSERT”的等价
+                    # 业务语义，避免把 PostgreSQL 方言泄漏到 GaussDB O 兼容库。
+                    _gaussdb_replace_insert_by_id(model, data_source[i : i + batch_size], preserve)
+                    continue
                 else:
                     query = query.on_conflict(conflict_target="id", preserve=preserve)
             query.execute()
