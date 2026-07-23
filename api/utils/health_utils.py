@@ -24,6 +24,7 @@ from rag.utils.redis_conn import REDIS_CONN
 from rag.utils.es_conn import ESConnection
 from rag.utils.infinity_conn import InfinityConnection
 from rag.utils.ob_conn import OBConnection
+from rag.utils.gaussdb_conn import GaussDBConnection
 from common import settings
 
 
@@ -118,6 +119,113 @@ def get_oceanbase_status():
         return {
             "status": "timeout",
             "message": f"error: {str(e)}",
+        }
+
+
+def _mask_gaussdb_string(value: str) -> str:
+    message = str(value)
+    for marker in ("password=", "password:"):
+        idx = message.lower().find(marker)
+        if idx >= 0:
+            end = message.find(" ", idx)
+            if end < 0:
+                end = len(message)
+            return f"{message[:idx]}{marker}***{message[end:]}"
+    return message
+
+
+def _mask_gaussdb_secret(value):
+    if isinstance(value, dict):
+        return {k: _mask_gaussdb_secret(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_mask_gaussdb_secret(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_mask_gaussdb_secret(v) for v in value)
+    if isinstance(value, str):
+        return _mask_gaussdb_string(value)
+    return value
+
+
+def _get_gaussdb_connection():
+    conn = getattr(settings, "docStoreConn", None)
+    if conn is not None and getattr(conn, "db_type", lambda: None)() == "gaussdb":
+        return conn
+    return GaussDBConnection()
+
+
+def get_gaussdb_status():
+    doc_engine = os.getenv("DOC_ENGINE", "elasticsearch").lower()
+    if doc_engine != "gaussdb":
+        return {
+            "status": "not_configured",
+            "message": "GaussDB is not configured as the document engine",
+        }
+    try:
+        conn = _get_gaussdb_connection()
+        health_info = _mask_gaussdb_secret(conn.health())
+        performance_metrics = _mask_gaussdb_secret(conn.get_performance_metrics())
+        status = "alive" if health_info.get("status") == "healthy" else "timeout"
+        return {
+            "status": status,
+            "message": {
+                "health": health_info,
+                "performance": performance_metrics,
+            },
+        }
+    except Exception as e:
+        return {
+            "status": "timeout",
+            "message": f"error: {_mask_gaussdb_string(str(e))}",
+        }
+
+
+def check_gaussdb_health() -> dict:
+    doc_engine = os.getenv("DOC_ENGINE", "elasticsearch").lower()
+    if doc_engine != "gaussdb":
+        return {
+            "status": "not_configured",
+            "details": {
+                "connection": "not_configured",
+                "message": "GaussDB is not configured as the document engine",
+            },
+        }
+
+    try:
+        conn = _get_gaussdb_connection()
+        health_info = _mask_gaussdb_secret(conn.health())
+        performance_metrics = _mask_gaussdb_secret(conn.get_performance_metrics())
+        connection_status = performance_metrics.get("connection", "unknown")
+        if connection_status == "disconnected" or health_info.get("status") != "healthy":
+            return {
+                "status": "unhealthy",
+                "details": {
+                    "connection": connection_status,
+                    "latency_ms": performance_metrics.get("latency_ms", 0),
+                    "uri": health_info.get("uri", "unknown"),
+                    "version": health_info.get("version_comment", "unknown"),
+                    "sql_compatibility": health_info.get("sql_compatibility", "unknown"),
+                    "error": health_info.get("error", performance_metrics.get("error", "")),
+                },
+            }
+
+        is_healthy = connection_status == "connected" and performance_metrics.get("latency_ms", float("inf")) < 1000
+        return {
+            "status": "healthy" if is_healthy else "degraded",
+            "details": {
+                "connection": connection_status,
+                "latency_ms": performance_metrics.get("latency_ms", 0),
+                "uri": health_info.get("uri", "unknown"),
+                "version": health_info.get("version_comment", "unknown"),
+                "sql_compatibility": health_info.get("sql_compatibility", "unknown"),
+            },
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "details": {
+                "connection": "disconnected",
+                "error": _mask_gaussdb_string(str(e)),
+            },
         }
 
 
