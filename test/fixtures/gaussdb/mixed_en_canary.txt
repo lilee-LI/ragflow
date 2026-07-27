@@ -1,0 +1,4 @@
+Helios Robotics overseas pilot review
+On 8 May 2026, engineer Olivia Hart in Bristol approved EdgePilot X7 for a retired packing cell.
+Helios Robotics set SLA 99.50% and a latency alert threshold of 83ms because its downstream camera gateway remained on a single network link.
+The Bristol pilot was archived after the conveyor controller was decommissioned.

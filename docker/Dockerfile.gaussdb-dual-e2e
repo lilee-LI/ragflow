@@ -1,0 +1,7 @@
+FROM infiniflow/ragflow:v0.26.4
+
+RUN uv pip install \
+    --python /ragflow/.venv/bin/python \
+    "langgraph==1.2.0" \
+    "rapidfuzz==3.14.5" \
+    "zai-sdk==0.2.3"
