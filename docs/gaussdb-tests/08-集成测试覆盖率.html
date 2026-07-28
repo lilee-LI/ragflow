@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GaussDB 集成测试覆盖率</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { max-width: 1080px; margin: 2rem auto; padding: 0 1.2rem; line-height: 1.55; }
+    h1 { margin-bottom: .2rem; }
+    .muted { color: #667085; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+    .card { border: 1px solid #98a2b3; border-radius: .6rem; padding: 1rem; }
+    .metric { font-size: 1.75rem; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+    th, td { border: 1px solid #98a2b3; padding: .65rem; text-align: left; }
+    th { background: #e9eef5; color: #101828; }
+    code { word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h1>GaussDB 集成测试覆盖率</h1>
+  <p class="muted">来源：2026-07-27 在同一冻结 HEAD <code>d5530a785e1dde0d67a4bbd5c88978ef8d003671</code> 的真实 Centralized 与 Distributed pytest 执行。此页面由两个 Cobertura XML 产物汇总生成。</p>
+
+  <div class="cards">
+    <section class="card">
+      <h2>Centralized</h2>
+      <div class="metric">81.71%</div>
+      <div>line：1,613 / 1,974</div>
+      <div>branch：587 / 838（70.05%）</div>
+      <div>155 passed，0 failed/error/skipped/xfail</div>
+    </section>
+    <section class="card">
+      <h2>Distributed</h2>
+      <div class="metric">81.81%</div>
+      <div>line：1,615 / 1,974</div>
+      <div>branch：586 / 838（69.93%）</div>
+      <div>153 passed，0 failed/error/skipped/xfail</div>
+    </section>
+  </div>
+
+  <h2>逐文件对比</h2>
+  <table>
+    <thead><tr><th>文件</th><th>Centralized line</th><th>Centralized branch</th><th>Distributed line</th><th>Distributed branch</th></tr></thead>
+    <tbody>
+      <tr><td><code>common/doc_store/gaussdb_conn_base.py</code></td><td>81.20%</td><td>68.10%</td><td>81.10%</td><td>67.86%</td></tr>
+      <tr><td><code>rag/utils/gaussdb_conn.py</code></td><td>82.25%</td><td>72.01%</td><td>82.57%</td><td>72.01%</td></tr>
+    </tbody>
+  </table>
+
+  <h2>产物完整性</h2>
+  <table>
+    <thead><tr><th>产物</th><th>mtime（UTC）</th><th>SHA-256</th></tr></thead>
+    <tbody>
+      <tr><td>Centralized coverage XML</td><td>2026-07-27T13:14:33Z</td><td><code>b9a1223c4f4155f208760cf6b7c27b109ccc701b0532794b38290494b53c453a</code></td></tr>
+      <tr><td>Distributed coverage XML</td><td>2026-07-27T15:06:53Z</td><td><code>5c7ff977340aa475284a791ad4b7467ce95bae8470885fbb274bf4e775fd729a</code></td></tr>
+    </tbody>
+  </table>
+
+  <p class="muted">覆盖率展示本次真实 adapter/数据库路径的代码命中，不替代 01–05 的 155 个正式集成 TC 场景覆盖结论。</p>
+</body>
+</html>
