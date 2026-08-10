@@ -1,0 +1,918 @@
+{
+  "schema_version": 1,
+  "batch_id": "20260727_combined_001",
+  "reports": {
+    "01_startup_migration_report.md": [
+      {
+        "case_id": "TC-SM-001",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/01_startup_migration/TC-SM-001.json"
+      },
+      {
+        "case_id": "TC-SM-002",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/01_startup_migration/TC-SM-002.json"
+      },
+      {
+        "case_id": "TC-SM-003",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/01_startup_migration/TC-SM-003.json"
+      },
+      {
+        "case_id": "TC-SM-005",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/01_startup_migration/TC-SM-005.json"
+      },
+      {
+        "case_id": "TC-SM-012",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/01_startup_migration/TC-SM-012.json"
+      },
+      {
+        "case_id": "TC-SM-015",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/01_startup_migration/TC-SM-015.json"
+      },
+      {
+        "case_id": "TC-SM-018",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/01_startup_migration/TC-SM-018.json"
+      }
+    ],
+    "02_user_management_report.md": [
+      {
+        "case_id": "TC-UM-014",
+        "control": "PASS",
+        "experiment": "FAIL",
+        "attribution": "实验组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/02_user_management/TC-UM-014.json"
+      },
+      {
+        "case_id": "TC-UM-044",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/02_user_management/TC-UM-044.json"
+      },
+      {
+        "case_id": "TC-UM-045",
+        "control": "BLOCKED",
+        "experiment": "BLOCKED",
+        "attribution": "两组均阻塞",
+        "evidence": "runs/20260727_combined_001/evidence_private/02_user_management/TC-UM-045.json"
+      },
+      {
+        "case_id": "TC-UM-046",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/02_user_management/TC-UM-046.json"
+      },
+      {
+        "case_id": "TC-UM-047",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/02_user_management/TC-UM-047.json"
+      }
+    ],
+    "02_user_management_admin_supplement_report.md": [
+      {
+        "case_id": "TC-UM-ADMIN-006",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/02_user_management_admin_supplement/TC-UM-ADMIN-006.json"
+      },
+      {
+        "case_id": "TC-UM-ADMIN-016",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/02_user_management_admin_supplement/TC-UM-ADMIN-016.json"
+      },
+      {
+        "case_id": "TC-UM-ADMIN-020",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/02_user_management_admin_supplement/TC-UM-ADMIN-020.json"
+      }
+    ],
+    "03_auth_token_session_report.md": [
+      {
+        "case_id": "TC-AT-028",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/03_authentication/TC-AT-028.json"
+      },
+      {
+        "case_id": "TC-AT-048",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/03_authentication/TC-AT-048.json"
+      },
+      {
+        "case_id": "TC-AT-050",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/03_authentication/TC-AT-050.json"
+      },
+      {
+        "case_id": "TC-AT-SOFTDEL-002",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/03_authentication/TC-AT-SOFTDEL-002.json"
+      },
+      {
+        "case_id": "TC-AT-SOFTDEL-003",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/03_authentication/TC-AT-SOFTDEL-003.json"
+      },
+      {
+        "case_id": "TC-AT-KEYPAIR-002",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/03_authentication/TC-AT-KEYPAIR-002.json"
+      },
+      {
+        "case_id": "TC-AT-PWD-LENGTH-001",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/03_authentication/TC-AT-PWD-LENGTH-001.json"
+      },
+      {
+        "case_id": "TC-AT-PWD-LENGTH-002",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/03_authentication/TC-AT-PWD-LENGTH-002.json"
+      },
+      {
+        "case_id": "TC-AT-EXCEPTION-001",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/03_authentication/TC-AT-EXCEPTION-001.json"
+      },
+      {
+        "case_id": "TC-AT-EXCEPTION-003",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/03_authentication/TC-AT-EXCEPTION-003.json"
+      }
+    ],
+    "04_dataset_document_report.md": [
+      {
+        "case_id": "TC-DD-022",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-022.json"
+      },
+      {
+        "case_id": "TC-DD-025",
+        "control": "PASS",
+        "experiment": "FAIL",
+        "attribution": "实验组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-025.json"
+      },
+      {
+        "case_id": "TC-DD-026",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-026.json"
+      },
+      {
+        "case_id": "TC-DD-027",
+        "control": "PASS",
+        "experiment": "FAIL",
+        "attribution": "实验组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-027.json"
+      },
+      {
+        "case_id": "TC-DD-028",
+        "control": "PASS",
+        "experiment": "FAIL",
+        "attribution": "实验组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-028.json"
+      },
+      {
+        "case_id": "TC-DD-035",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-035.json"
+      },
+      {
+        "case_id": "TC-DD-047",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-047.json"
+      },
+      {
+        "case_id": "TC-DD-DEL-004",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-DEL-004.json"
+      },
+      {
+        "case_id": "TC-DD-TAG-001",
+        "control": "PASS",
+        "experiment": "FAIL",
+        "attribution": "实验组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-TAG-001.json"
+      },
+      {
+        "case_id": "TC-DD-TAG-002",
+        "control": "PASS",
+        "experiment": "FAIL",
+        "attribution": "实验组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-TAG-002.json"
+      },
+      {
+        "case_id": "TC-DD-TAG-003",
+        "control": "PASS",
+        "experiment": "FAIL",
+        "attribution": "实验组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-TAG-003.json"
+      },
+      {
+        "case_id": "TC-DD-TAG-004",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-TAG-004.json"
+      },
+      {
+        "case_id": "TC-DD-TAG-005",
+        "control": "PASS",
+        "experiment": "FAIL",
+        "attribution": "实验组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-TAG-005.json"
+      },
+      {
+        "case_id": "TC-DD-IDX-001",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-IDX-001.json"
+      },
+      {
+        "case_id": "TC-DD-IDX-003",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-IDX-003.json"
+      },
+      {
+        "case_id": "TC-DD-IDX-004",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-IDX-004.json"
+      },
+      {
+        "case_id": "TC-DD-EMB-001",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-EMB-001.json"
+      },
+      {
+        "case_id": "TC-DD-INGEST-001",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-INGEST-001.json"
+      },
+      {
+        "case_id": "TC-DD-INGEST-002",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/04_dataset_document/TC-DD-INGEST-002.json"
+      }
+    ],
+    "05_chat_session_agent_report.md": [
+      {
+        "case_id": "TC-CS-001",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-001.json"
+      },
+      {
+        "case_id": "TC-CS-003",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-003.json"
+      },
+      {
+        "case_id": "TC-CS-022",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-022.json"
+      },
+      {
+        "case_id": "TC-CS-026",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-026.json"
+      },
+      {
+        "case_id": "TC-CS-030",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-030.json"
+      },
+      {
+        "case_id": "TC-CS-035",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-035.json"
+      },
+      {
+        "case_id": "TC-CS-036",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-036.json"
+      },
+      {
+        "case_id": "TC-CS-037",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-037.json"
+      },
+      {
+        "case_id": "TC-CS-038",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-038.json"
+      },
+      {
+        "case_id": "TC-CS-039",
+        "control": "PASS",
+        "experiment": "FAIL",
+        "attribution": "实验组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-039.json"
+      },
+      {
+        "case_id": "TC-CS-046",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-046.json"
+      },
+      {
+        "case_id": "TC-CS-055",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-055.json"
+      },
+      {
+        "case_id": "TC-CS-060",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-060.json"
+      },
+      {
+        "case_id": "TC-CS-066",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-066.json"
+      },
+      {
+        "case_id": "TC-CS-067",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-067.json"
+      },
+      {
+        "case_id": "TC-CS-068",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-068.json"
+      },
+      {
+        "case_id": "TC-CS-075",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-075.json"
+      },
+      {
+        "case_id": "TC-CS-077",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-077.json"
+      },
+      {
+        "case_id": "TC-CS-086",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-086.json"
+      },
+      {
+        "case_id": "TC-CS-087",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-087.json"
+      },
+      {
+        "case_id": "TC-CS-091",
+        "control": "PASS",
+        "experiment": "FAIL",
+        "attribution": "实验组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-091.json"
+      },
+      {
+        "case_id": "TC-CS-095",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-095.json"
+      },
+      {
+        "case_id": "TC-CS-097",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-097.json"
+      },
+      {
+        "case_id": "TC-CS-098",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CS-098.json"
+      },
+      {
+        "case_id": "TC-CHAT-DEL-005",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/05_chat_session_agent/TC-CHAT-DEL-005.json"
+      }
+    ],
+    "06_memory_metadata_report.md": [
+      {
+        "case_id": "TC-MM-005",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/06_memory_metadata/TC-MM-005.json"
+      },
+      {
+        "case_id": "TC-MM-006",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/06_memory_metadata/TC-MM-006.json"
+      },
+      {
+        "case_id": "TC-MM-011",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/06_memory_metadata/TC-MM-011.json"
+      },
+      {
+        "case_id": "TC-MM-SUP-013",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/06_memory_metadata/TC-MM-SUP-013.json"
+      },
+      {
+        "case_id": "TC-MM-SUP-022",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/06_memory_metadata/TC-MM-SUP-022.json"
+      },
+      {
+        "case_id": "TC-MM-SUP-023",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/06_memory_metadata/TC-MM-SUP-023.json"
+      }
+    ],
+    "07_memory_store_report.md": [
+      {
+        "case_id": "TC-MS-001",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-001.json"
+      },
+      {
+        "case_id": "TC-MS-100",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-100.json"
+      },
+      {
+        "case_id": "TC-MS-101",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-101.json"
+      },
+      {
+        "case_id": "TC-MS-103",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-103.json"
+      },
+      {
+        "case_id": "TC-MS-104",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-104.json"
+      },
+      {
+        "case_id": "TC-MS-107",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-107.json"
+      },
+      {
+        "case_id": "TC-MS-205",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-205.json"
+      },
+      {
+        "case_id": "TC-MS-206",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-206.json"
+      },
+      {
+        "case_id": "TC-MS-207",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-207.json"
+      },
+      {
+        "case_id": "TC-MS-208",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-208.json"
+      },
+      {
+        "case_id": "TC-MS-212",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-212.json"
+      },
+      {
+        "case_id": "TC-MS-306",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-306.json"
+      },
+      {
+        "case_id": "TC-MS-400",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-400.json"
+      },
+      {
+        "case_id": "TC-MS-401",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-401.json"
+      },
+      {
+        "case_id": "TC-MS-405",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-405.json"
+      },
+      {
+        "case_id": "TC-MS-406",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-406.json"
+      },
+      {
+        "case_id": "TC-MS-500",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-500.json"
+      },
+      {
+        "case_id": "TC-MS-702",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-702.json"
+      },
+      {
+        "case_id": "TC-MS-803",
+        "control": "FAIL",
+        "experiment": "PASS",
+        "attribution": "对照组独有",
+        "evidence": "runs/20260727_combined_001/evidence_private/07_memory_store/TC-MS-803.json"
+      }
+    ],
+    "08_file_report.md": [
+      {
+        "case_id": "TC-FM-004",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-004.json"
+      },
+      {
+        "case_id": "TC-FM-005",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-005.json"
+      },
+      {
+        "case_id": "TC-FM-017",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-017.json"
+      },
+      {
+        "case_id": "TC-FM-019",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-019.json"
+      },
+      {
+        "case_id": "TC-FM-037",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-037.json"
+      },
+      {
+        "case_id": "TC-FM-045",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-045.json"
+      },
+      {
+        "case_id": "TC-FM-046",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-046.json"
+      },
+      {
+        "case_id": "TC-FM-047",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-047.json"
+      },
+      {
+        "case_id": "TC-FM-048",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-048.json"
+      },
+      {
+        "case_id": "TC-FM-049",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-049.json"
+      },
+      {
+        "case_id": "TC-FM-050",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-050.json"
+      },
+      {
+        "case_id": "TC-FM-051",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-051.json"
+      },
+      {
+        "case_id": "TC-FM-052",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-052.json"
+      },
+      {
+        "case_id": "TC-FM-053",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-053.json"
+      },
+      {
+        "case_id": "TC-FM-054",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-054.json"
+      },
+      {
+        "case_id": "TC-FM-055",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-055.json"
+      },
+      {
+        "case_id": "TC-FM-056",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-056.json"
+      },
+      {
+        "case_id": "TC-FM-057",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-057.json"
+      },
+      {
+        "case_id": "TC-FM-060",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-060.json"
+      },
+      {
+        "case_id": "TC-FM-061",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-061.json"
+      },
+      {
+        "case_id": "TC-FM-066",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FM-066.json"
+      },
+      {
+        "case_id": "TC-FILE-VER-001",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FILE-VER-001.json"
+      },
+      {
+        "case_id": "TC-FILE-VER-002",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FILE-VER-002.json"
+      },
+      {
+        "case_id": "TC-FILE-VER-003",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FILE-VER-003.json"
+      },
+      {
+        "case_id": "TC-FILE-VER-004",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FILE-VER-004.json"
+      },
+      {
+        "case_id": "TC-FILE-VER-005",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FILE-VER-005.json"
+      },
+      {
+        "case_id": "TC-FILE-VER-006",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/08_file/TC-FILE-VER-006.json"
+      }
+    ],
+    "09_connector_system_report.md": [
+      {
+        "case_id": "TC-CONN-015",
+        "control": "BLOCKED",
+        "experiment": "BLOCKED",
+        "attribution": "两组均阻塞",
+        "evidence": "runs/20260727_combined_001/evidence_private/09_connector/TC-CONN-015.json"
+      },
+      {
+        "case_id": "TC-CONN-016",
+        "control": "BLOCKED",
+        "experiment": "BLOCKED",
+        "attribution": "两组均阻塞",
+        "evidence": "runs/20260727_combined_001/evidence_private/09_connector/TC-CONN-016.json"
+      },
+      {
+        "case_id": "TC-CONN-093",
+        "control": "BLOCKED",
+        "experiment": "BLOCKED",
+        "attribution": "两组均阻塞",
+        "evidence": "runs/20260727_combined_001/evidence_private/09_connector/TC-CONN-093.json"
+      },
+      {
+        "case_id": "TC-CONN-094",
+        "control": "BLOCKED",
+        "experiment": "PASS",
+        "attribution": "对照环境阻塞/实验组通过",
+        "evidence": "runs/20260727_combined_001/evidence_private/09_connector/TC-CONN-094.json"
+      }
+    ],
+    "10_fault_recovery_report.md": [
+      {
+        "case_id": "TC-FR-027",
+        "control": "FAIL",
+        "experiment": "FAIL",
+        "attribution": "对照组也存在",
+        "evidence": "runs/20260727_combined_001/evidence_private/10_fault_recovery/TC-FR-027.json"
+      }
+    ]
+  },
+  "totals": {
+    "non_pass_cases": 126,
+    "实验组独有": 10,
+    "对照组也存在": 95,
+    "对照组独有": 16,
+    "两组均阻塞": 4,
+    "对照环境阻塞/实验组通过": 1
+  }
+}
